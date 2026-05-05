@@ -1,5 +1,7 @@
 # C++ Translator
 
+## Basis
+
 Goal: <br>
     Given any c++ Header, generate a zig file which can link with it.
 
@@ -24,3 +26,18 @@ Todo:
   - [ ] static members
   - [ ] parent casting
   - [ ] virtual inheritance
+
+## Usage
+
+```bash
+$ translator ./header.hpp
+```
+
+## Building
+
+This project uses the zig build system, and depends on `castxml` as a runtime dependency.
+Ensure `castxml` is in your `PATH` for the application to work.
+
+```bash
+$ zig build
+```
