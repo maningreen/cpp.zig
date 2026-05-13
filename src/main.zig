@@ -5,26 +5,36 @@ const token = @import("token.zig");
 const util = @import("util.zig");
 
 /// Caller owns memory
-fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const argv = &.{ "castxml", "--castxml-output=1", path, "-o", "-" };
+/// returns the output, and stderr of the program
+fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: []const []const u8) ![]u8 {
+    const argv =
+        try std.mem.concat(
+            gpa,
+            []const u8,
+            &.{
+                &.{ "castxml", "--castxml-output=1", path, "-o", "-" },
+                &.{ "--castxml-cc-gnu", "(", "zig", "c++" },
+                flags,
+                &.{")"},
+            },
+        );
+    defer gpa.free(argv);
+    std.log.info("Started program", .{});
     var child = try std.process.spawn(io, .{
         .argv = argv,
-        .stderr = .close, // why is this ignore? well, because we want to ignore global headers.
+        .stderr = .inherit,
         .cwd = .inherit,
         .stdin = .ignore,
         .stdout = .pipe,
     });
+    std.log.info("Ended program", .{});
     const file = child.stdout orelse unreachable;
-    var readBuf: [1028]u8 = undefined;
-    var stdin = file.reader(io, &readBuf);
-    var contents: []u8 = try gpa.alloc(u8, try file.length(io));
+    var buf: [1028]u8 = undefined;
+    var stdin = file.reader(io, &buf);
+    std.log.info("Started buffering", .{});
+    const contents = try stdin.interface.allocRemaining(gpa, .unlimited);
+    std.log.info("Ended buffering", .{});
     errdefer gpa.free(contents);
-    while (true) {
-        const line = try stdin.interface.takeDelimiter('\n') orelse break;
-        contents = try gpa.realloc(contents, contents.len + line.len + 1);
-        std.mem.copyForwards(u8, contents[contents.len - (line.len + 1) ..], line);
-        contents[contents.len - 1] = '\n';
-    }
     const c = try child.wait(io);
     switch (c) {
         .stopped, .signal => |v| {
@@ -34,7 +44,12 @@ fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
         .exited => |e| {
             if (e != 0) {
                 std.log.info("Return code: {d}", .{e});
-                return error.ExitCode;
+                for (argv) |a|
+                    std.log.debug("Argument: {s}", .{a});
+                std.log.debug("command: ", .{});
+                for (argv) |a|
+                    std.debug.print("{s} ", .{a});
+                std.debug.print("\n", .{});
             }
         },
         .unknown => return error.Unknown,
@@ -67,9 +82,8 @@ fn fieldInfo(comptime T: type, comptime fieldTag: std.meta.FieldEnum(T)) std.bui
 
     for (@typeInfo(T).@"struct".fields) |field| {
         @setEvalBranchQuota(5000);
-        if (comptime std.mem.eql(u8, field.name, tagname)) {
+        if (comptime std.mem.eql(u8, field.name, tagname))
             return field;
-        }
     }
     @compileError("fieldTag of type " ++ @tagName(T) ++ " does not exist in the struct!");
 }
@@ -102,12 +116,14 @@ fn parseTokens(gpa: std.mem.Allocator, input: []const u8) !TokenContainer {
             },
             .element_start => {
                 const element_name = reader.elementNameNs();
+                std.log.info("Parsing element: {s}", .{element_name.local});
                 const t = token.getItem(element_name.local);
 
                 if (state != null) {
                     switch (state.?) {
                         inline else => |*s| {
                             const T = @TypeOf(s.*);
+                            @setEvalBranchQuota(10000);
                             if (isInFieldArray(T, element_name.local)) |v| {
                                 switch (v) {
                                     inline else => |tag| {
@@ -173,27 +189,47 @@ fn parseTokens(gpa: std.mem.Allocator, input: []const u8) !TokenContainer {
     return container;
 }
 
-fn printFile(io: std.Io, gpa: std.mem.Allocator, out: *std.Io.Writer, file: []const u8) !void {
-    const ret = try getAST(io, gpa, file);
+fn printFile(io: std.Io, gpa: std.mem.Allocator, out: *std.Io.Writer, file: []const u8, args: []const []const u8) !void {
+    const ret = try getAST(io, gpa, file, args);
     defer gpa.free(ret);
     if (ret.len <= 2) {
         try out.print("", .{});
         return;
     }
+    std.log.info("Parsing tokens...", .{});
     var container = try parseTokens(gpa, ret);
+    std.log.info("Done parsing tokens!", .{});
     defer container.deinit(gpa);
+    std.log.info("Printing", .{});
     try token.Namespace.write(null, gpa, container, out);
+}
+
+fn arrayCast(
+    comptime In: type,
+    comptime Out: type,
+    gpa: std.mem.Allocator,
+    in: []const In,
+    comptime cast: fn (anytype) Out,
+) ![]Out {
+    const arr = try gpa.alloc(Out, in.len);
+    for (in, 0..) |v, i|
+        arr[i] = cast(v);
+    return arr;
 }
 
 pub fn main(init: std.process.Init) !void {
     if (init.minimal.args.vector.len == 1) return;
     const file = std.Io.File.stdout();
     defer file.close(init.io);
-    var writeBuf: [1028]u8 = undefined;
+    var writeBuf: [4096 * 4]u8 = undefined;
     var writer = file.writer(init.io, &writeBuf);
-    for (init.minimal.args.vector[1..]) |arg| {
-        const l = std.mem.len(arg);
-        try printFile(init.io, init.gpa, &writer.interface, arg[0..l]);
-    }
-    try writer.flush();
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const xmlArgs, const argsI = for (args[1..], 1..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--")) break .{ args[i + 1 ..], i };
+    } else .{ &.{}, args.len };
+
+    for (args[1..argsI]) |arg|
+        try printFile(init.io, init.gpa, &writer.interface, arg, xmlArgs);
+
+    try writer.interface.flush();
 }

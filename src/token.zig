@@ -15,10 +15,12 @@ const typeMap = std.static_string_map.StaticStringMap(struct { []const u8, enum 
     .{ "unsigned char", .{ "h", .primitive } },
     .{ "short", .{ "s", .primitive } },
     .{ "unsigned short", .{ "t", .primitive } },
+    .{ "short unsigned int", .{ "t", .primitive } },
     .{ "int", .{ "i", .primitive } },
     .{ "unsigned int", .{ "j", .primitive } },
     .{ "long", .{ "l", .primitive } },
     .{ "unsigned long", .{ "m", .primitive } },
+    .{ "long unsigned int", .{ "m", .primitive } },
     .{ "long long", .{ "x", .primitive } },
     .{ "unsigned long long", .{ "y", .primitive } },
     .{ "__int128", .{ "n", .primitive } },
@@ -55,11 +57,14 @@ pub const @"type" = enum {
     CvQualifiedType,
     Function,
     Variable,
+    ElaboratedType,
+    Union,
+    AtomicType,
 };
 
 pub const Method = struct {
     name: []u8,
-    mangled: []u8,
+    mangled: []u8 = "",
     id: []u8,
     returns: []u8,
     // context: []u8,
@@ -72,8 +77,8 @@ pub const Method = struct {
 };
 
 pub const Class = struct {
-    name: []u8,
-    members: []u8,
+    name: []u8 = "",
+    members: []u8 = "",
     id: []u8,
     context: []u8,
     size: u64,
@@ -92,11 +97,15 @@ pub const Class = struct {
     };
 
     pub fn write(self: Class, gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+        if (std.mem.eql(u8, self.name, "")) {
+            // Ghost class
+            return;
+        }
         if (self.incomplete) return;
-        // var paddingIndex: u64 = 0;
-        try writer.print("pub const @\"{s}\" = extern struct {{\n", .{self.name});
-        // var memberIterator = std.mem.splitScalar(u8, self.members, ' ');
-        // var initIterator: u64 = 0;
+        try writer.print(
+            \\const @"{s}" = extern struct {{
+            \\
+        , .{self.id});
 
         var fields = std.ArrayList([]const u8).empty;
         defer fields.deinit(gpa);
@@ -159,7 +168,7 @@ pub const Class = struct {
                                         \\) @This() {{
                                         \\  var t: [{d}]u8 align({d}) = undefined;
                                         \\  {s}(@ptrCast(&t),
-                                    , .{ @divExact(self.size, 8), self.@"align" / 8, mangled });
+                                    , .{ @divExact(self.size, 8), @divExact(self.@"align", 8), mangled });
 
                                     for (constructor.arguments, 0..) |_, i|
                                         try writer.print("_{d}, ", .{i});
@@ -265,7 +274,8 @@ pub const Class = struct {
         // try writer.print(vtableName ++ ": *anyopaque,\n", .{});
         // }
 
-        try writer.print("}};\nconst {s} = @\"{s}\";\n", .{ self.id, self.name });
+        std.log.info("id: {s}", .{self.id});
+        try writer.print("}};\npub const {s} = @\"{s}\";\n", .{ self.name, self.id });
     }
 
     /// prints out all of the fields of the class,
@@ -559,7 +569,7 @@ pub const Constructor = struct {
                         try mangledName.writer.print("R", .{});
                         t = ref.type;
                     },
-                    inline .Class, .Struct => |cplx| {
+                    inline .Union, .Class, .Struct => |cplx| {
                         try mangledName.writer.print("{d}{s}", .{ cplx.name.len, cplx.name });
                         break;
                     },
@@ -567,7 +577,10 @@ pub const Constructor = struct {
                         try mangledName.writer.print("{s}", .{if (cv.@"const") "K" else ""});
                         t = cv.type;
                     },
-                    else => unreachable,
+                    inline .ElaboratedType, .Typedef => |td| {
+                        t = td.type;
+                    },
+                    else => |_, tag| std.debug.panic("Reached invalid argument of type {s}", .{@tagName(tag)}),
                 }
             }
         } else {
@@ -621,7 +634,7 @@ pub const ReferenceType = struct {
     size: u64,
     @"align": u64,
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
-        const name = try namespacedType(self.type, data, gpa) orelse unreachable;
+        const name = try namespacedType(self.type, data, gpa) orelse return;
         defer gpa.free(name);
         try writer.print("const {s} = *{s}; //ref type\n", .{ self.id, name });
     }
@@ -723,6 +736,10 @@ pub const Namespace = struct {
             else
                 false;
 
+        if (selfM) |s|
+            if (isroot)
+                try writer.print("const {s} = @This();\n", .{s.id});
+
         if (!isroot)
             if (selfM) |self|
                 try writer.print("pub const {s} = struct {{\n", .{self.name});
@@ -743,16 +760,19 @@ pub const Namespace = struct {
                         else => std.mem.eql(u8, self.id, value.context),
                     } and if (member == .Namespace) !std.mem.eql(u8, self.id, value.id) else true;
 
-                    if (inSelf)
+                    if (inSelf) {
                         try value.write(gpa, data, writer);
+                    }
                 } else {
                     const inSelf = switch (@typeInfo(@TypeOf(value.context))) {
                         .optional => value.context == null,
                         else => false,
                     };
-                    if (inSelf)
+                    if (inSelf) {
                         try value.write(gpa, data, writer);
+                    }
                 }
+                try writer.flush();
             }
         }
         if (!isroot)
@@ -770,8 +790,8 @@ pub const Typedef = struct {
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
-        try writer.print("const {s} = {s}; // typedef\n", .{ self.id, self.name });
-        try writer.print("const {s} = {s}; // typedef\n", .{ self.name, self.type });
+        _ = self;
+        _ = writer;
     }
 };
 
@@ -779,26 +799,35 @@ pub const ArrayType = struct {
     id: []u8,
     type: []u8,
     min: u64,
-    max: u64,
+    max: ?u64,
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
-        const size = self.max - self.min + 1;
-        try writer.print("const {s} = ?[{d}]{s}; // arr type\n", .{
-            self.id,
-            size,
-            self.type,
-        });
+        if (self.max) |m| {
+            try writer.print("const {s} = ?[{d}]{s}; // arr type\n", .{
+                self.id,
+                m - self.min + 1,
+                self.type,
+            });
+        } else {
+            try writer.print("const {s} = ?[*]{s}; // arr type\n", .{
+                self.id,
+                self.type,
+            });
+        }
     }
 };
 
 pub const CvQualifiedType = struct {
     id: []u8,
     type: []u8,
-    @"const": bool,
+    @"const": bool = false,
+    @"volatile": bool = false,
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
-        const name = try namespacedType(self.type, data, gpa) orelse unreachable;
+        const name = try namespacedType(self.type, data, gpa) orelse
+            std.debug.panic("Error, {s} not found!\n", .{self.type});
         defer gpa.free(name);
+        std.log.info("Printing {s}: {any}", .{ @typeName(@This()), self.id });
         try writer.print("const {s} = {s}; // cv type\n", .{ self.id, name });
     }
 };
@@ -808,26 +837,13 @@ pub const Function = struct {
     name: []u8,
     returns: []u8,
     context: []u8,
-    mangled: []u8,
+    mangled: []u8 = "",
     arguments: []Argument = &.{},
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
-        try writer.print(
-            \\extern "c" fn {s}(
-        ,
-            .{self.mangled},
-        );
-        for (self.arguments) |arg| {
-            try writer.print("{s}, ", .{arg.type});
-        }
-        try writer.print(
-            \\) {s};
-            \\pub const {s} = {s};
-            \\
-        ,
-            .{ self.returns, self.name, self.mangled },
-        );
+        _ = writer;
+        std.log.info("Printing function named \"{s}\"", .{self.name});
     }
 };
 
@@ -835,9 +851,40 @@ pub const Variable = struct {
     id: []u8,
     name: []u8,
     type: []u8,
-    access: Access,
+    access: ?Access = null,
     static: bool,
-    mangled: []u8,
+    mangled: []u8 = "",
+};
+
+pub const ElaboratedType = struct {
+    id: []u8,
+    type: []u8,
+    qualifier: ?[]u8 = null,
+    keyword: ?KeywordType = null,
+
+    const KeywordType = enum {
+        class,
+        @"struct",
+        @"union",
+        @"enum",
+        @"typename",
+    };
+};
+
+pub const Union = struct {
+    id: []u8,
+    context: []u8,
+    name: []u8,
+    members: []u8 = "",
+    size: u64,
+    @"align": u64,
+};
+
+pub const AtomicType = struct {
+    id: []u8,
+    type: []u8,
+    size: u64,
+    @"align": u64,
 };
 
 pub const Argument = struct {
@@ -905,44 +952,40 @@ pub fn getItem(str: []const u8) ?@"type" {
     return null;
 }
 
-/// writes the full namespaced type
-/// returns the outputted slice
-pub fn namespacedType(id: []const u8, data: TokenContainer, gpa: std.mem.Allocator) !?[]u8 {
-    var parent = switch (data.find(id) orelse return null) {
-        inline else => |val| val.id,
-    };
-
-    var parents: std.ArrayList([]const u8) = try .initCapacity(gpa, 1);
-    defer {
-        for (parents.items) |value|
-            gpa.free(value);
-        parents.deinit(gpa);
-    }
-
-    const fmt =
-        \\@"{s}"
-    ;
-
-    while (data.find(parent)) |grandparent| {
-        switch (grandparent) {
-            .Class, .Struct => |parentVal| {
-                parent = parentVal.context;
-                try parents.append(gpa, try std.fmt.allocPrint(gpa, fmt, .{parentVal.name}));
+/// Writes the full namespaced type
+/// Returns the outputted slice
+pub fn namespacedType(id: []const u8, data: TokenContainer, gpa: std.mem.Allocator) !?[]const u8 {
+    if (data.find(id)) |self| {
+        switch (self) {
+            inline else => |selfVal, selfTag| {
+                const Type = StructType(selfTag);
+                if (comptime @hasField(Type, "context")) {
+                    if (@as(?[]const u8, selfVal.context)) |ctx| {
+                        const parent = try namespacedType(ctx, data, gpa) orelse
+                            return null;
+                        defer gpa.free(parent);
+                        return try std.mem.concat(
+                            gpa,
+                            u8,
+                            &.{
+                                parent,
+                                ".",
+                                selfVal.id,
+                            },
+                        );
+                    } else return {
+                        const mem = try gpa.alloc(u8, id.len);
+                        @memcpy(mem, id);
+                        return mem;
+                    };
+                } else {
+                    const mem = try gpa.alloc(u8, id.len);
+                    @memcpy(mem, id);
+                    return mem;
+                }
             },
-            .Namespace => |namespace| {
-                parent = namespace.context orelse break;
-                try parents.append(gpa, try std.fmt.allocPrint(gpa, fmt, .{namespace.name}));
-            },
-            inline .FundamentalType, .CvQualifiedType, .ReferenceType => |t| {
-                try parents.append(gpa, try std.fmt.allocPrint(gpa, fmt, .{t.id}));
-                break;
-            },
-            inline else => |_, t| @panic("reached " ++ @tagName(t) ++ ", undefined!"),
         }
-    }
-    std.mem.reverse([]const u8, parents.items);
-
-    return try std.mem.join(gpa, ".", parents.items);
+    } else return null;
 }
 
 /// Given a type, creates a `deinit` function for the type.
@@ -953,6 +996,13 @@ pub fn namespacedType(id: []const u8, data: TokenContainer, gpa: std.mem.Allocat
 pub fn deinitToken(comptime T: type) fn (*T, std.mem.Allocator) void {
     const fun = (struct {
         fn function(self: *T, gpa: std.mem.Allocator) void {
+            switch (@typeInfo(T)) {
+                .@"enum" => {
+                    std.log.info("Enum value: {d}", .{@intFromEnum(self.*)});
+                },
+                else => void{},
+            }
+            std.log.info("Freeing {any} of type {}", .{ self, T });
             switch (@typeInfo(T)) {
                 .pointer => |ptr| {
                     switch (ptr.size) {
@@ -1038,15 +1088,20 @@ fn getUnderlyingType(token: anytype, data: TokenContainer) TokenUnion {
                 .ArrayType,
                 .PointerType,
                 .ReferenceType,
+                .Union,
                 => return @unionInit(TokenUnion, @tagName(t), token),
 
                 inline .CvQualifiedType,
                 .Variable,
                 .Typedef,
                 .Field,
+                .ElaboratedType,
                 .Enumeration,
                 => {
-                    return switch (data.find(token.type) orelse unreachable) {
+                    return switch (data.find(token.type) orelse {
+                        std.log.info("Type: {s}, id: {s}", .{ @typeName(T), token.id });
+                        std.debug.panic("Missing token id: {s}", .{token.type});
+                    }) {
                         inline else => |v| getUnderlyingType(v, data),
                     };
                 },
@@ -1062,12 +1117,22 @@ fn getUnderlyingType(token: anytype, data: TokenContainer) TokenUnion {
 /// returns size in bytes, and alignment in bytes
 fn getTypeSize(token: anytype, data: TokenContainer) @Tuple(&.{ u64, u64 }) {
     const underlying = getUnderlyingType(token, data);
-    if (@TypeOf(token) == ArrayType) {
-        const underlyingInfo = getTypeSize(token.type, data);
-        return .{
-            underlyingInfo[0] * (token.max - token.min + 1),
-            underlyingInfo[1],
-        };
+    switch (underlying) {
+        .ArrayType => |arr| {
+            const underlyingInfo = switch (data.find(arr.type) orelse unreachable) {
+                inline else => |t| getTypeSize(t, data),
+            };
+            if (arr.max) |m| {
+                return .{
+                    underlyingInfo[0] * (m - arr.min + 1),
+                    underlyingInfo[1],
+                };
+            } else return .{
+                0,
+                underlyingInfo[1],
+            };
+        },
+        else => void{},
     }
 
     const @"align" = switch (underlying) {
@@ -1076,8 +1141,9 @@ fn getTypeSize(token: anytype, data: TokenContainer) @Tuple(&.{ u64, u64 }) {
         .Class,
         .Struct,
         .FundamentalType,
+        .Union,
         => |v| v.@"align",
-        else => unreachable,
+        inline else => |v| std.debug.panic("Underlying is type of {s}", .{@typeName(@TypeOf(v))}),
     };
     const size = switch (underlying) {
         inline .PointerType,
@@ -1085,8 +1151,9 @@ fn getTypeSize(token: anytype, data: TokenContainer) @Tuple(&.{ u64, u64 }) {
         .Class,
         .Struct,
         .FundamentalType,
+        .Union,
         => |v| v.size / 8,
-        else => unreachable,
+        inline else => |v| std.debug.panic("Underlying is type of {s}", .{@typeName(@TypeOf(v))}),
     };
     return .{ size, @"align" };
 }

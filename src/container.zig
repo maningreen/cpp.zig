@@ -6,8 +6,10 @@ const TokenUnion = token.TokenUnion;
 
 data: Data,
 
-pub const Data: type = blk: {
-    const count: comptime_int = std.enums.values(token.type).len;
+pub const Data: type = EnumMap(token.type);
+
+fn EnumMap(comptime @"enum": type) type {
+    const count: comptime_int = std.enums.values(@"enum").len;
     var typeNames: [count][]const u8 = undefined;
     var typeAttrs: [count]std.builtin.Type.StructField.Attributes = undefined;
     var typeTypes: [count]type = undefined;
@@ -19,14 +21,14 @@ pub const Data: type = blk: {
             .@"comptime" = false,
         };
     }
-    break :blk @Struct(
+    return @Struct(
         .auto,
         null,
         &typeNames,
         &typeTypes,
         &typeAttrs,
     );
-};
+}
 
 pub fn init() TokenContainer {
     var self: TokenContainer = undefined;
@@ -67,6 +69,7 @@ pub fn getType(self: @This(), id: []const u8) ?token.type {
     }
     return null;
 }
+
 pub fn find(self: @This(), id: []const u8) ?TokenUnion {
     inline for (std.enums.values(token.type)) |tokenType|
         if (@field(self.data, @tagName(tokenType)).get(id)) |val|

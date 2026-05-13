@@ -6,14 +6,9 @@ export fn callstack() callconv(.c) void {
 }
 
 pub fn main() !void {
-    var t = Testing.Foo.Test2.init0();
-    const sum = Testing.Foo.sum(30, 30);
-    defer t.deinit();
-    t.testingFunction(30);
-
-    std.log.debug("sum: {d}", .{sum});
+    const t = Testing.Foo.@"Test2".init0();
     inline for (@typeInfo(@TypeOf(t)).@"struct".fields) |field| {
-        const fieldValue = @field(t, field.name);
-        std.log.debug("t.{s}: {any}", .{ field.name, fieldValue });
+        const fval = @field(t, field.name);
+        std.log.debug("t.{s}: {any}", .{ field.name, fval });
     }
 }
