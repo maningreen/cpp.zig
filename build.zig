@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .optimize = optimize,
         .target = target,
-        .root_source_file = runTool.captureStdOut(.{.basename = "testing.zig"}),
+        .root_source_file = runTool.captureStdOut(.{ .basename = "testing.zig" }),
     }));
 
     const testExe = b.addExecutable(.{
