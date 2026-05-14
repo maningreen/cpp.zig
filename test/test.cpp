@@ -35,10 +35,6 @@ Test2::~Test2() {
     std::cout << "Test2 Died!\n";
 }
 
-float Foo::sum(float a, float b) {
-    return a + b;
-}
-
 float sum(float a, float b) {
     return a + b;
 }

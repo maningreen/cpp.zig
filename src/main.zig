@@ -19,7 +19,7 @@ fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: []const [
             },
         );
     defer gpa.free(argv);
-    std.log.info("Started program", .{});
+    std.log.info("Started castxml", .{});
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .stderr = .inherit,
@@ -27,7 +27,7 @@ fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: []const [
         .stdin = .ignore,
         .stdout = .pipe,
     });
-    std.log.info("Ended program", .{});
+    std.log.info("Ended Castxml", .{});
     const file = child.stdout orelse unreachable;
     var buf: [1028]u8 = undefined;
     var stdin = file.reader(io, &buf);
@@ -116,7 +116,6 @@ fn parseTokens(gpa: std.mem.Allocator, input: []const u8) !TokenContainer {
             },
             .element_start => {
                 const element_name = reader.elementNameNs();
-                std.log.info("Parsing element: {s}", .{element_name.local});
                 const t = token.getItem(element_name.local);
 
                 if (state != null) {
@@ -198,10 +197,10 @@ fn printFile(io: std.Io, gpa: std.mem.Allocator, out: *std.Io.Writer, file: []co
     }
     std.log.info("Parsing tokens...", .{});
     var container = try parseTokens(gpa, ret);
-    std.log.info("Done parsing tokens!", .{});
     defer container.deinit(gpa);
-    std.log.info("Printing", .{});
-    try token.Namespace.write(null, gpa, container, out);
+    std.log.info("Done parsing tokens", .{});
+    std.log.info("Printing to stdout", .{});
+    try token.Namespace.write(null, gpa, container, try token.Namespace.Context.init(gpa, container), out);
 }
 
 fn arrayCast(
@@ -221,7 +220,7 @@ pub fn main(init: std.process.Init) !void {
     if (init.minimal.args.vector.len == 1) return;
     const file = std.Io.File.stdout();
     defer file.close(init.io);
-    var writeBuf: [4096 * 4]u8 = undefined;
+    var writeBuf: [1028]u8 = undefined;
     var writer = file.writer(init.io, &writeBuf);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const xmlArgs, const argsI = for (args[1..], 1..) |arg, i| {

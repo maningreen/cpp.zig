@@ -29,15 +29,14 @@ pub fn ensure(x: bool) error{False}!void {
 }
 
 pub fn getBaseName(comptime T: type) [:0]const u8 {
-    const returnval = comptime blk: {
+    comptime {
         const full_name = @typeName(T);
         // Find the last index of '.'
         if (std.mem.lastIndexOfScalar(u8, full_name, '.')) |index| {
-            break :blk full_name[index + 1 ..];
+            return full_name[index + 1 ..];
         }
-        break :blk full_name;
-    };
-    return returnval;
+        return full_name;
+    }
 }
 
 pub fn tagToFieldName(comptime T: type) [:0]const u8 {
@@ -49,4 +48,15 @@ pub fn tagToFieldName(comptime T: type) [:0]const u8 {
         const lowercaseFirst = std.ascii.toLower(basename[0]);
         break :blk lowercaseFirst ++ basename[1..] ++ suffix;
     };
+}
+
+/// asserts that T has a decl named `name`
+pub fn DeclType(comptime T: type, comptime name: []const u8) type {
+    switch (@typeInfo(T)) {
+        .@"struct" => {
+            const decl = @field(T, name);
+            return @TypeOf(decl);
+        },
+        else => |_, t| @compileError("Error, type \"" ++ @typeName(T) ++ "\" is not a struct and is a " ++ @tagName(t)),
+    }
 }

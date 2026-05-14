@@ -96,7 +96,7 @@ pub const Class = struct {
         offset: u64,
     };
 
-    pub fn write(self: Class, gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: Class, gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         if (self.name.len == 0)
             // Ghost class
             return;
@@ -439,7 +439,7 @@ pub const FundamentalType = struct {
         bool,
         void,
     };
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
         const t: FundTypes =
@@ -600,7 +600,7 @@ pub const Enumeration = struct {
     size: u64,
     @"align": u64,
     scoped: bool,
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
         if (self.name.len == 0) return;
@@ -637,7 +637,7 @@ pub const PointerType = struct {
     type: []u8,
     size: u64,
     @"align": u64,
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
         try writer.print("const {s} = ?*{s}; //ptr type\n", .{ self.id, self.type });
@@ -649,7 +649,7 @@ pub const ReferenceType = struct {
     type: []u8,
     size: u64,
     @"align": u64,
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         const name = try namespacedType(self.type, data, gpa) orelse return;
         defer gpa.free(name);
         try writer.print("const {s} = *{s}; //ref type\n", .{ self.id, name });
@@ -731,7 +731,99 @@ pub const Namespace = struct {
     pub const rootNamespaceId = "_1";
     pub const rootNamespace = "::";
 
-    pub fn write(selfM: ?@This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub const Context = struct {
+        data: ContextData,
+
+        const ContextData = generateData();
+
+        fn generateData() type {
+            comptime {
+                const values =
+                    for (std.enums.values(@"type"), 0..) |v, i| {
+                        if (v == .Namespace)
+                            break std.enums.values(@"type")[0..i] ++ std.enums.values(@"type")[i + 1 ..];
+                    } else std.enums.values(@"type");
+
+                var names: [values.len][]const u8 = undefined;
+                var types: [values.len]type = undefined;
+                const attrs = &[1]std.builtin.Type.StructField.Attributes{
+                    .{
+                        .@"align" = null,
+                        .@"comptime" = false,
+                        .default_value_ptr = null,
+                    },
+                } ** values.len;
+
+                for (values, 0..) |member, i| {
+                    names[i] = @tagName(member);
+                    const T = StructType(member);
+                    if (@hasDecl(T, "Context")) {
+                        if (@typeInfo(util.DeclType(T, "Context")) != .type)
+                            @compileError("Context on " ++ @tagName(member) ++ " must be a `type`! is " ++ @typeName(util.DeclType(T, "Context")));
+                        types[i] = @field(T, "Context");
+                    } else {
+                        types[i] = void;
+                    }
+                }
+
+                return @Struct(.auto, null, &names, &types, attrs);
+            }
+        }
+
+        pub fn init(gpa: std.mem.Allocator, data: TokenContainer) !Context {
+            var ctx: Context = undefined;
+            inline for (@typeInfo(Context).@"struct".fields) |fieldInfo| {
+                const field = &@field(ctx, fieldInfo.name);
+                const FieldType = fieldInfo.type;
+                switch (@typeInfo(FieldType)) {
+                    .@"struct" => {
+                        if (@hasDecl(FieldType, "init")) {
+                            const InitType = @FieldType(FieldType, "init");
+                            if (InitType == FieldType) {
+                                field = @field(FieldType, "init");
+                            } else {
+                                switch (@typeInfo(InitType)) {
+                                    .@"fn" => |func| {
+                                        switch (@typeInfo(func.return_type orelse void)) {}
+                                        if ((func.return_type orelse void) != FieldType // no point in calling
+                                        or func.params.len > 2 // we only can supply 2
+                                        )
+                                            continue;
+                                        const shouldCare: bool = for (func.params) |p| {
+                                            if (p.type orelse break false) |v| {
+                                                if (v != TokenContainer and v != std.mem.Allocator) break false;
+                                            }
+                                        } else true;
+
+                                        if (shouldCare) {
+                                            const Args = std.meta.ArgsTuple(InitType);
+                                            var a: Args = undefined;
+                                            for (@typeInfo(InitType).@"fn".params, 0..) |p, i| {
+                                                a[i] = switch (p.type orelse unreachable) {
+                                                    TokenContainer => data,
+                                                    std.mem.Allocator => gpa,
+                                                    else => unreachable,
+                                                };
+                                            }
+                                            switch (@typeInfo(func.return_type orelse unreachable)) {
+                                                .error_union => {},
+                                            }
+                                            field = @call(.auto, @field(field, "init"), a);
+                                        }
+                                    },
+                                    else => void{},
+                                }
+                            }
+                        }
+                    },
+                    else => void{},
+                }
+            }
+            return ctx;
+        }
+    };
+
+    pub fn write(selfM: ?@This(), gpa: std.mem.Allocator, data: TokenContainer, ctx: Context, writer: *std.Io.Writer) !void {
         const members = comptime [_]@"type"{
             .FundamentalType,
             .ArrayType,
@@ -758,14 +850,15 @@ pub const Namespace = struct {
 
         if (!isroot)
             if (selfM) |self|
-                try writer.print("pub const {s} = struct {{\n", .{self.id});
+                try writer.print("const {s} = struct {{\n", .{self.id});
 
         inline for (members) |member| {
             const values = data.get(member);
             for (values.values()) |value| {
-                if (!@hasField(StructType(member), "context")) {
+                const Member = StructType(member);
+                if (!@hasField(Member, "context")) {
                     if (selfM == null) {
-                        try value.write(gpa, data, writer);
+                        try value.write(gpa, data, @field(ctx.data, @tagName(member)), writer);
                     }
                     continue;
                 }
@@ -777,7 +870,11 @@ pub const Namespace = struct {
                     } and if (member == .Namespace) !std.mem.eql(u8, self.id, value.id) else true;
 
                     if (inSelf) {
-                        try value.write(gpa, data, writer);
+                        if (member == .Namespace) {
+                            try value.write(gpa, data, ctx, writer);
+                        } else {
+                            try value.write(gpa, data, @field(ctx.data, @tagName(member)), writer);
+                        }
                     }
                 } else {
                     const inSelf = switch (@typeInfo(@TypeOf(value.context))) {
@@ -785,7 +882,11 @@ pub const Namespace = struct {
                         else => false,
                     };
                     if (inSelf) {
-                        try value.write(gpa, data, writer);
+                        if (member == .Namespace) {
+                            try value.write(gpa, data, ctx, writer);
+                        } else {
+                            try value.write(gpa, data, @field(ctx, @tagName(member)), writer);
+                        }
                     }
                 }
                 try writer.flush();
@@ -805,7 +906,7 @@ pub const Typedef = struct {
     type: []u8,
     context: []u8,
 
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
         _ = self;
@@ -818,7 +919,7 @@ pub const ArrayType = struct {
     type: []u8,
     min: u64,
     max: ?u64,
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
         if (self.max) |m| {
@@ -841,7 +942,7 @@ pub const CvQualifiedType = struct {
     type: []u8,
     @"const": bool = false,
     @"volatile": bool = false,
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         const name = try namespacedType(self.type, data, gpa) orelse
             std.debug.panic("Error, {s} not found!\n", .{self.type});
         defer gpa.free(name);
@@ -860,14 +961,39 @@ pub const Function = struct {
     artificial: bool = false,
     @"extern": bool = false,
 
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    /// Used for context for the Function write function
+    pub const Context = std.hash_map.StringHashMap(std.ArrayList(*const Function));
+
+    pub fn initContext(data: TokenContainer, gpa: std.mem.Allocator) !Context {
+        var self = Context.init(gpa);
+        for (data.get(.Function).values()) |*func| {
+            const value = try self.getOrPut(func.name);
+            if (value.found_existing) {
+                value.value_ptr.append(gpa, func);
+            } else {
+                value.value_ptr = std.ArrayList(*const Function).empty;
+                value.value_ptr.append(gpa, func);
+            }
+        }
+    }
+
+    pub fn freeContext(ctx: Context, gpa: std.mem.Allocator) void {
+        var it = ctx.valueIterator();
+        while (it.next()) |v| {
+            gpa.free(v);
+        }
+        ctx.deinit();
+    }
+
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, ctx: Context, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
+        _ = ctx;
         // anon function
         if (self.name.len == 0 or self.@"inline")
             return;
-        std.log.info("Printing function named \"{s}\"", .{self.name});
         const externName = if (self.mangled.len == 0) self.name else self.mangled;
+        const writeAlias = !std.mem.eql(u8, self.mangled, self.name) and self.mangled.len != 0;
         try writer.print(
             \\extern "c" fn @"{s}"(
         , .{externName});
@@ -881,7 +1007,7 @@ pub const Function = struct {
             \\) callconv(.c) {s};
             \\
         , .{self.returns});
-        if (externName.ptr != self.name.ptr)
+        if (writeAlias)
             try writer.print(
                 \\pub const @"{s}" = @"{s}";
                 \\
@@ -921,7 +1047,7 @@ pub const Union = struct {
     size: u64,
     @"align": u64,
 
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !void {
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
         if (self.name.len == 0) return;
