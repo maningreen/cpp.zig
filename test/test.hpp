@@ -33,3 +33,4 @@ class Test2 : public Test<Bar> {
 };  // namespace Foo
 
 float sum(float a, float b);
+float sum(double a, double b);

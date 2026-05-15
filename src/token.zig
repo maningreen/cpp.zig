@@ -342,7 +342,7 @@ pub const Class = struct {
     ///     virtual void function(void);
     /// };
     /// ```
-    /// and an ample `data` structure, will lead to the following being written
+    /// and an ample `data` structure, will lead to the following being written to `writer`
     /// ```zig
     /// function: *const fn (void) void,
     /// ```
@@ -772,47 +772,53 @@ pub const Namespace = struct {
 
         pub fn init(gpa: std.mem.Allocator, data: TokenContainer) !Context {
             var ctx: Context = undefined;
-            inline for (@typeInfo(Context).@"struct".fields) |fieldInfo| {
-                const field = &@field(ctx, fieldInfo.name);
+            inline for (@typeInfo(Context.ContextData).@"struct".fields) |fieldInfo| {
+                const field = &@field(ctx.data, fieldInfo.name);
                 const FieldType = fieldInfo.type;
                 switch (@typeInfo(FieldType)) {
                     .@"struct" => {
-                        if (@hasDecl(FieldType, "init")) {
-                            const InitType = @FieldType(FieldType, "init");
-                            if (InitType == FieldType) {
-                                field = @field(FieldType, "init");
-                            } else {
-                                switch (@typeInfo(InitType)) {
-                                    .@"fn" => |func| {
-                                        switch (@typeInfo(func.return_type orelse void)) {}
-                                        if ((func.return_type orelse void) != FieldType // no point in calling
-                                        or func.params.len > 2 // we only can supply 2
-                                        )
-                                            continue;
-                                        const shouldCare: bool = for (func.params) |p| {
-                                            if (p.type orelse break false) |v| {
-                                                if (v != TokenContainer and v != std.mem.Allocator) break false;
-                                            }
-                                        } else true;
-
-                                        if (shouldCare) {
-                                            const Args = std.meta.ArgsTuple(InitType);
-                                            var a: Args = undefined;
-                                            for (@typeInfo(InitType).@"fn".params, 0..) |p, i| {
-                                                a[i] = switch (p.type orelse unreachable) {
-                                                    TokenContainer => data,
-                                                    std.mem.Allocator => gpa,
-                                                    else => unreachable,
-                                                };
-                                            }
-                                            switch (@typeInfo(func.return_type orelse unreachable)) {
-                                                .error_union => {},
-                                            }
-                                            field = @call(.auto, @field(field, "init"), a);
+                        const InitType = util.DeclType(FieldType, "init");
+                        if (InitType == FieldType) {
+                            field.* = @field(FieldType, "init");
+                        } else {
+                            switch (@typeInfo(InitType)) {
+                                .@"fn" => |func| {
+                                    if ((func.return_type orelse void) != FieldType // no point in calling
+                                    and @typeInfo((func.return_type orelse void)) != .error_union and func.params.len > 2 // we only can supply 2
+                                    )
+                                        continue;
+                                    const shouldCare: bool = inline for (func.params) |p| {
+                                        if (p.type) |v| {
+                                            if (v != TokenContainer and v != std.mem.Allocator) break false;
                                         }
-                                    },
-                                    else => void{},
-                                }
+                                    } else true;
+
+                                    if (shouldCare) {
+                                        std.log.debug("Calling init!", .{});
+                                        const Args = std.meta.ArgsTuple(InitType);
+                                        var a: Args = undefined;
+                                        inline for (@typeInfo(InitType).@"fn".params, 0..) |p, i| {
+                                            a[i] = switch (p.type orelse unreachable) {
+                                                TokenContainer => data,
+                                                std.mem.Allocator => gpa,
+                                                else => unreachable,
+                                            };
+                                        }
+                                        switch (@typeInfo(func.return_type orelse unreachable)) {
+                                            .error_union => |err| {
+                                                if (err.payload != FieldType)
+                                                    continue
+                                                else {
+                                                    field.* = try @call(.auto, @field(FieldType, "init"), a);
+                                                    continue;
+                                                }
+                                            },
+                                            else => void{},
+                                        }
+                                        field.* = @call(.auto, @field(FieldType, "init"), a);
+                                    }
+                                },
+                                else => void{},
                             }
                         }
                     },
@@ -820,6 +826,23 @@ pub const Namespace = struct {
                 }
             }
             return ctx;
+        }
+
+        pub fn deinit(self: *Context, gpa: std.mem.Allocator) void {
+            inline for (@typeInfo(@TypeOf(self.data)).@"struct".fields) |fieldInfo| {
+                switch (@typeInfo(fieldInfo.type)) {
+                    .@"struct" => {
+                        if (@hasDecl(fieldInfo.type, "deinit")) {
+                            const FnType = util.DeclType(fieldInfo.type, "deinit");
+                            std.debug.assert(FnType == fn (fieldInfo.type, std.mem.Allocator) void //
+                            or FnType == fn (*fieldInfo.type, std.mem.Allocator) void //
+                            );
+                            @field(self.data, fieldInfo.name).deinit(gpa);
+                        }
+                    },
+                    else => continue,
+                }
+            }
         }
     };
 
@@ -962,33 +985,44 @@ pub const Function = struct {
     @"extern": bool = false,
 
     /// Used for context for the Function write function
-    pub const Context = std.hash_map.StringHashMap(std.ArrayList(*const Function));
+    pub const Context = struct {
+        data: std.hash_map.StringHashMap(std.ArrayList([]const u8)),
 
-    pub fn initContext(data: TokenContainer, gpa: std.mem.Allocator) !Context {
-        var self = Context.init(gpa);
-        for (data.get(.Function).values()) |*func| {
-            const value = try self.getOrPut(func.name);
-            if (value.found_existing) {
-                value.value_ptr.append(gpa, func);
-            } else {
-                value.value_ptr = std.ArrayList(*const Function).empty;
-                value.value_ptr.append(gpa, func);
+        pub fn init(data: TokenContainer, gpa: std.mem.Allocator) !Context {
+            var self = std.hash_map.StringHashMap(std.ArrayList([]const u8)).init(gpa);
+            for (data.get(.Function).values()) |*func| {
+                const value = try self.getOrPut(func.name);
+                if (value.found_existing) {
+                    try value.value_ptr.append(gpa, func.id);
+                } else {
+                    value.value_ptr.* = std.ArrayList([]const u8).empty;
+                    try value.value_ptr.append(gpa, func.id);
+                }
             }
+            return .{ .data = self };
         }
-    }
 
-    pub fn freeContext(ctx: Context, gpa: std.mem.Allocator) void {
-        var it = ctx.valueIterator();
-        while (it.next()) |v| {
-            gpa.free(v);
+        pub fn deinit(self: *Context, gpa: std.mem.Allocator) void {
+            var it = self.data.valueIterator();
+            while (it.next()) |v|
+                v.deinit(gpa);
+            self.data.deinit();
         }
-        ctx.deinit();
-    }
+    };
 
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, ctx: Context, writer: *std.Io.Writer) !void {
-        _ = gpa;
-        _ = data;
-        _ = ctx;
+        const fns = ctx.data.get(self.name) orelse unreachable;
+        const overloaded: bool = (fns).items.len > 1;
+
+        // if first overloaded item
+        if (overloaded and std.mem.eql(u8, fns.items[0], self.id)) {
+            std.log.debug("Initial, writing {s}", .{self.name});
+            try writer.print(
+                \\pub const {s} = struct {{
+                \\
+            , .{self.name});
+        }
+
         // anon function
         if (self.name.len == 0 or self.@"inline")
             return;
@@ -1007,11 +1041,38 @@ pub const Function = struct {
             \\) callconv(.c) {s};
             \\
         , .{self.returns});
+
+        const append = if (overloaded) try generateTypeSig(self, gpa, data) else "";
+        defer gpa.free(append);
+
         if (writeAlias)
             try writer.print(
-                \\pub const @"{s}" = @"{s}";
+                \\pub const @"{s}{s}" = @"{s}";
                 \\
-            , .{ self.name, self.mangled });
+            , .{ self.name, append, self.mangled });
+
+        // if last overloaded item
+        if (overloaded and std.mem.eql(u8, fns.items[fns.items.len - 1], self.id)) {
+            std.log.debug("Final, writing {s}", .{self.name});
+            try writer.print(
+                \\}};
+                \\
+            , .{});
+        }
+    }
+
+    /// prints out the types of the function
+    pub fn generateTypeSig(f: Function, gpa: std.mem.Allocator, data: TokenContainer) ![]u8 {
+        var writer: std.Io.Writer.Allocating = std.Io.Writer.Allocating.init(gpa);
+        errdefer writer.deinit();
+
+        for (f.arguments) |arg| {
+            const str = try arg.printName(gpa, data);
+            defer gpa.free(str);
+            try writer.writer.print("{s}", .{str});
+        }
+
+        return writer.toOwnedSlice();
     }
 };
 
@@ -1079,10 +1140,28 @@ pub const AtomicType = struct {
 pub const Argument = struct {
     // name: []u8,
     type: []u8,
-    pub fn printName(self: Argument, gpa: std.mem.Allocator) ![]u8 {
-        _ = gpa;
-        typeMap.get(self.type);
+
+    /// returned memory is owned by caller
+    pub fn printName(self: Argument, gpa: std.mem.Allocator, data: TokenContainer) PrintError![]u8 {
+        const fundType = try getUnderlyingType(self, data) orelse return PrintError.InvalidArgumentType;
+        switch (fundType) {
+            inline else => |val| {
+                if (!@hasField(@TypeOf(val), "name")) std.debug.panic("Error: {} does not have member `type`", .{@TypeOf(val)});
+                const found = typeMap.get(val.name);
+                if (found) |str| {
+                    const retStr = try gpa.alloc(u8, str.@"0".len);
+                    @memcpy(retStr, str.@"0");
+                    return retStr;
+                } else {
+                    const retStr = try gpa.alloc(u8, val.name.len);
+                    @memcpy(retStr, val.name);
+                    return retStr;
+                }
+            },
+        }
     }
+
+    pub const PrintError = error{InvalidArgumentType} || DataSearch || std.mem.Allocator.Error;
 };
 
 pub fn setValue(

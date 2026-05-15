@@ -200,7 +200,10 @@ fn printFile(io: std.Io, gpa: std.mem.Allocator, out: *std.Io.Writer, file: []co
     defer container.deinit(gpa);
     std.log.info("Done parsing tokens", .{});
     std.log.info("Printing to stdout", .{});
-    try token.Namespace.write(null, gpa, container, try token.Namespace.Context.init(gpa, container), out);
+    var ctx = try token.Namespace.Context.init(gpa, container);
+    defer ctx.deinit(gpa);
+
+    try token.Namespace.write(null, gpa, container, ctx, out);
 }
 
 fn arrayCast(

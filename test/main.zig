@@ -1,8 +1,7 @@
 const std = @import("std");
 const Testing = @import("testing");
 
-export fn callstack() callconv(.c) void {
-}
+export fn callstack() callconv(.c) void {}
 
 pub fn main() !void {
     var t = Testing.Foo.Test2.init0();
@@ -12,4 +11,5 @@ pub fn main() !void {
         std.log.debug("t.{s}: {any}", .{ field.name, fval });
     }
     t.testingFunction(30);
+    _ = Testing.sum.sumdd(30, 30);
 }
