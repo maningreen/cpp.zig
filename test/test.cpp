@@ -4,22 +4,26 @@
 
 using namespace Foo;
 
-template <typename T> void Test<T>::testingFunction(double delta) {
+void Test::testingFunction(double delta) {
   std::cout << delta << ' ' << testingChar << '\n';
 }
 
-template <typename T> void Test<T>::testingFunction(float delta) {
+void Test::testingFunction(float delta) {
   std::cout << delta << ' ' << testingChar << '\n';
 }
 
-template <typename T> Test<T>::Test() {}
+Test::Test() {}
 
-template <typename T> Test<T>::Test(int i) {
+Test::Test(int i) {
   std::cout << "SDLF:KSF:L\n";
   std::cout << "test alt\n" << i << '\n';
 }
 
-template <typename T> Test<T>::~Test() {}
+void Foo::Test::test() const {
+    std::cout << "TEST CALLED";
+}
+
+Test::~Test() {}
 
 void Test2::testingFunction(double delta) { std::cout << delta << '\n'; }
 
@@ -34,5 +38,3 @@ Test2::~Test2() { std::cout << "Test2 Died!\n"; }
 float sum(float a, float b) { return a + b; }
 
 double sum(double a, double b) { return a + b; }
-
-Test<int> t;

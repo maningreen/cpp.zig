@@ -80,16 +80,16 @@ fn isInFieldArray(comptime T: type, itemType: []const u8) ?std.meta.FieldEnum(T)
 }
 
 fn fieldInfo(comptime T: type, comptime fieldTag: std.meta.FieldEnum(T)) std.builtin.Type.StructField {
-    if (@typeInfo(T) != .@"struct") @compileError(@typeName(T) ++ " is not of type struct!");
-
-    const tagname = comptime @tagName(fieldTag);
-
-    for (@typeInfo(T).@"struct".fields) |field| {
-        @setEvalBranchQuota(5000);
-        if (comptime std.mem.eql(u8, field.name, tagname))
-            return field;
+    comptime {
+        if (@typeInfo(T) != .@"struct") @compileError(@typeName(T) ++ " is not of type struct!");
+        const tagname = @tagName(fieldTag);
+        for (@typeInfo(T).@"struct".fields) |field| {
+            @setEvalBranchQuota(5000);
+            if (std.mem.eql(u8, field.name, tagname))
+                return field;
+        }
+        @compileError("fieldTag of type " ++ @tagName(T) ++ " does not exist in the struct!");
     }
-    @compileError("fieldTag of type " ++ @tagName(T) ++ " does not exist in the struct!");
 }
 
 /// returned memory is owned by caller.

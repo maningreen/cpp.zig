@@ -4,7 +4,6 @@ struct Bar {
 
 namespace Foo {
 
-template <typename T>
 class Test {
   public:
     virtual ~Test();
@@ -21,7 +20,7 @@ class Test {
     Test(int i);
 };
 
-class Test2 : public Test<Bar> {
+class Test2 : public Test {
   public:
     void testingFunction(double delta) override;
     Test2();
@@ -32,11 +31,3 @@ class Test2 : public Test<Bar> {
 
 
 };  // namespace Foo
-
-float sum(float a, float b);
-double sum(double a, double b);
-template<typename T>
-T sum(T a, T b);
-
-template<>
-int sum<int>(int j, int i);

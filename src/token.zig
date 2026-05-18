@@ -85,6 +85,7 @@ pub const Method = struct {
     mangled: []u8 = "",
     id: []u8,
     returns: []u8,
+    overrides: ?[]u8 = null,
     // context: []u8,
     arguments: []Argument = &.{},
     access: Access,
@@ -110,6 +111,24 @@ pub const Class = struct {
         const MethodData = std.array_list.Aligned([]const u8, null);
 
         data: DataType,
+
+        /// returns number of overloads `methodName` has
+        /// searches bases
+        pub fn overloadCount(self: Context, data: TokenContainer, classId: []const u8, methodName: []const u8) ?u64 {
+            const class = switch (data.find(classId) orelse return null) {
+                .Class, .Struct => |c| c,
+                else => return null,
+            };
+
+            const classData = self.data.get(classId) orelse return null;
+            const method = classData.get(methodName) orelse return null;
+
+            var baseCount: u64 = 0;
+            for (class.bases) |base|
+                baseCount += self.overloadCount(data, base.type, methodName) orelse 0;
+
+            return method.items.len + baseCount;
+        }
 
         pub fn init(gpa: std.mem.Allocator, tokens: TokenContainer) !Context {
             var data: DataType = .empty;
@@ -149,6 +168,8 @@ pub const Class = struct {
 
     const vtableName = "_vtable";
     const vtableType = "Vtable";
+
+    const overloadTableFmt = "Overloaded_{s}";
 
     const Base = struct {
         type: []u8,
@@ -209,29 +230,8 @@ pub const Class = struct {
             try self.writeFields(data, gpa, writer);
         }
 
-        const overloadTableFmt = "overloaded_{s}";
         // phase 2.5 -> print out overloaded fake members
-        blk: {
-            const map = context.data.get(self.id) orelse {
-                std.log.info("id: {s} not found!", .{self.id});
-                break :blk;
-            };
-
-            var methodIt = map.iterator();
-            while (methodIt.next()) |methods| {
-                if (methods.value_ptr.items.len > 1) {
-                    std.log.debug("found overloaded method named \"{s}\"", .{methods.key_ptr.*});
-                    try writer.print(
-                        \\{s}: 
-                    ++ overloadTableFmt ++
-                        \\,
-                        \\
-                    , .{ methods.key_ptr.*, methods.key_ptr.* });
-                } else {
-                    continue;
-                }
-            }
-        }
+        // try self.writeOverloadFields(data, context, writer);
 
         // Phase 3 -> print functions
         //
@@ -321,6 +321,7 @@ pub const Class = struct {
                         // we won't print it, it's internal only
                         if (method.access != .public) continue;
                         const prefix = if (method.@"const") "const " else "";
+                        if (context.overloadCount(data, self.id, method.name) orelse 0 > 1) continue;
                         if (method.virtual) {
                             try writer.print(
                                 \\pub fn {s}(self: *{s}@This(),
@@ -370,73 +371,9 @@ pub const Class = struct {
         }
 
         // funky overloaded function time
-        {
-            const values = context.data.get(self.id) orelse return DataSearch.MissingID;
-            var it = values.iterator();
-            while (it.next()) |v| {
-                if (v.value_ptr.items.len > 1) {
-                    std.log.debug("overloaded found method: {s}", .{v.key_ptr.*});
-                    try writer.print(
-                        "pub const " ++ overloadTableFmt ++ "= extern struct {{ ",
-                        .{v.key_ptr.*},
-                    );
-                    for (v.value_ptr.items) |methodId| {
-                        const method = data.get(.Method).get(methodId) orelse return DataSearch.MissingID;
-                        const prefix = if (method.@"const") "const" else "";
+        // try self.writeOverloadStructs(data, gpa, context, writer);
 
-                        try writer.print(
-                            \\extern fn @"{s}"(*{s} {s},
-                        , .{ method.mangled, prefix, self.id });
-                        for (method.arguments) |value| {
-                            try writer.print(
-                                \\ {s}, 
-                            , .{value.type});
-                        }
-                        try writer.print(
-                            \\) callconv(.c) {s};
-                            \\
-                        , .{method.returns});
-
-                        const typeSig = try generateTypeSig(method, gpa, data);
-                        defer gpa.free(typeSig);
-
-                        try writer.print(
-                            \\pub inline fn @"{s}{s}"(self: *{s}
-                        ++ overloadTableFmt ++ ", ", .{
-                            method.name,
-                            typeSig,
-                            prefix,
-                            method.name,
-                        });
-
-                        const argFmt = "arg_{d}";
-
-                        for (method.arguments, 0..) |arg, i| {
-                            try writer.print(argFmt ++
-                                \\: {s},
-                            , .{ i, arg.type });
-                        }
-
-                        try writer.print(
-                            \\) {s} {{
-                            \\  const parent: *{s} @"{s}" = @alignCast(@fieldParentPtr("{s}", self));
-                            \\  return @"{s}"(parent, 
-                        , .{ method.returns, prefix, self.name, method.name, method.mangled });
-                        for (method.arguments, 0..) |_, i|
-                            try writer.print(argFmt ++ ", ", .{i});
-                        try writer.print(
-                            \\);
-                            \\}}
-                            \\
-                        , .{});
-                    }
-                    try writer.print(
-                        \\}};
-                        \\
-                    , .{});
-                }
-            }
-        }
+        try self.writeParentCastFunctions(gpa, data, writer);
 
         try writer.print("}};\npub const @\"{s}\" = @\"{s}\";\n", .{ self.name, self.id });
     }
@@ -593,6 +530,217 @@ pub const Class = struct {
         std.mem.sort(VirtualUnion, arrList.items, void{}, cmp);
 
         return arrList.toOwnedSlice(gpa);
+    }
+
+    /// Given the following c++ class, and ample `ctx` and `data`, will write the given output
+    /// ```cpp
+    /// class MyClass {
+    ///     void myFunc2();
+    ///
+    ///     void myFunc(int);
+    ///     void myFunc(float);
+    /// }
+    /// ```
+    /// the following would be written to the inputted writer
+    /// ```zig
+    ///   myFunc: (overloadTableFmt)
+    /// ```
+    /// where `(overloadTableFmt)` is the format for overload tables, with `"myFunc"` as the item
+    pub fn writeOverloadFields(self: Class, data: TokenContainer, ctx: Context, out: *std.Io.Writer) (DataSearch || std.Io.Writer.Error)!void {
+        for (self.bases) |base| {
+            switch (base.access) {
+                .public => {
+                    switch (data.find(base.type) orelse continue) {
+                        .Struct, .Class => |v| try v.writeOverloadFields(data, ctx, out),
+                        else => continue,
+                    }
+                },
+                else => continue,
+            }
+        }
+
+        const selfData = ctx.data.get(self.id) orelse return DataSearch.MissingID;
+        var it = selfData.iterator();
+        while (it.next()) |methods| {
+            if (methods.value_ptr.items.len < 2)
+                // not overloaded, continue
+                continue;
+
+            std.log.debug("found overloaded method named \"{s}\"", .{methods.key_ptr.*});
+            try out.print(
+                \\{s}: 
+            ++ overloadTableFmt ++
+                \\,
+                \\
+            , .{ methods.key_ptr.*, methods.key_ptr.* });
+        }
+    }
+
+    /// Given the following c++ class, and ample `ctx` and `data`, will write the given output
+    /// ```cpp
+    /// class MyClass {
+    ///     void myFunc2();
+    ///
+    ///     void myFunc(int);
+    ///     void myFunc(float);
+    /// }
+    /// ```
+    /// the following would be written to the inputted writer
+    /// ```zig
+    /// pub const (overloadTableFmt) = packed struct (void) {
+    ///     pub inline fn myFunci(self: *(overloadTableFmt), arg_0: i) void {
+    ///          const parent = @as((MyClass.id), @fieldParentPtr("myFunc", self));
+    ///          return _ZN7MyClass6myFuncEi(parent, arg_0);
+    ///     }
+    ///     extern fn _ZN7MyClass6myFuncEi(*MyClass, i32) callconv(.c) void;
+    ///     pub inline fn myFuncd(self: *(overloadTableFmt), arg_0: i) void {
+    ///          const parent = @as((MyClass.id), @fieldParentPtr("myFunc", self));
+    ///          return _ZN7MyClass6myFuncEd(parent, arg_0);
+    ///     }
+    ///     extern fn _ZN7MyClass6myFuncEd(*MyClass, i32) callconv(.c) void;
+    /// }
+    /// ```
+    /// where `(overloadTableFmt)` is the format for overload tables, with `"myFunc"` as the item
+    pub fn writeOverloadStructs(self: Class, data: TokenContainer, gpa: std.mem.Allocator, ctx: Context, out: *std.Io.Writer) !void {
+        for (self.bases) |base| {
+            switch (base.access) {
+                .public => {
+                    switch (data.find(base.type) orelse continue) {
+                        .Class, .Struct => |s| {
+                            try s.writeOverloadStructs(data, gpa, ctx, out);
+                        },
+                        else => continue,
+                    }
+                },
+                else => continue,
+            }
+        }
+        const values = ctx.data.get(self.id) orelse return DataSearch.MissingID;
+        var it = values.iterator();
+        while (it.next()) |v| {
+            if (v.value_ptr.items.len > 1) {
+                std.log.debug("overloaded found method: {s}", .{v.key_ptr.*});
+                try out.print(
+                    "pub const " ++ overloadTableFmt ++ " = extern struct {{\n",
+                    .{v.key_ptr.*},
+                );
+                for (v.value_ptr.items) |methodId| {
+                    const method = data.get(.Method).get(methodId) orelse return DataSearch.MissingID;
+                    const prefix = if (method.@"const") "const" else "";
+
+                    try out.print(
+                        \\extern fn @"{s}"(*{s} {s},
+                    , .{ method.mangled, prefix, self.id });
+                    for (method.arguments) |value| {
+                        try out.print(
+                            \\ {s}, 
+                        , .{value.type});
+                    }
+                    try out.print(
+                        \\) callconv(.c) {s};
+                        \\
+                    , .{method.returns});
+
+                    const typeSig = try generateTypeSig(method, gpa, data);
+                    defer gpa.free(typeSig);
+
+                    try out.print(
+                        \\pub inline fn @"{s}{s}"(self: *{s}
+                    ++ overloadTableFmt ++ ", ", .{
+                        method.name,
+                        typeSig,
+                        prefix,
+                        method.name,
+                    });
+
+                    const argFmt = "arg_{d}";
+
+                    for (method.arguments, 0..) |arg, i| {
+                        try out.print(argFmt ++
+                            \\: {s},
+                        , .{ i, arg.type });
+                    }
+
+                    try out.print(
+                        \\) {s} {{
+                        \\  const parent: *{s} @"{s}" = @fieldParentPtr("{s}", self);
+                        \\  return @"{s}"(@alignCast(@ptrCast(parent)), 
+                    , .{ method.returns, prefix, self.name, method.name, method.mangled });
+                    for (method.arguments, 0..) |_, i|
+                        try out.print(argFmt ++ ", ", .{i});
+                    try out.print(
+                        \\);
+                        \\}}
+                        \\
+                    , .{});
+                }
+                try out.print(
+                    \\}};
+                    \\
+                , .{});
+            }
+        }
+    }
+
+    pub fn writeParentCastFunctions(self: Class, gpa: std.mem.Allocator, data: TokenContainer, out: *std.Io.Writer) !void {
+        // the first item is `self`
+        const basesT = (try self.getBases(gpa, data))[0..];
+        defer gpa.free(basesT);
+        const bases = basesT[1..];
+
+        for (bases) |base| {
+            if (base.access != .public) continue;
+            const baseClass = switch (data.find(base.type) orelse return DataSearch.MissingID) {
+                .Class, .Struct => |v| v,
+                else => unreachable,
+            };
+
+            const namespaced = try namespacedType(base.type, data, gpa) orelse return DataSearch.MissingID;
+            defer gpa.free(namespaced);
+
+            try out.print(
+                \\pub inline fn @"castTo{s}"(self: *@This()) *{s} {{
+                \\    const byte_ptr: usize = @intFromPtr(self);
+                \\    const casted: *{s} = @ptrFromInt(byte_ptr + {d});
+                \\    return casted;
+                \\}}
+                \\pub inline fn @"constCastTo{s}"(self: *const @This()) *const {s} {{
+                \\    const byte_ptr: usize = @intFromPtr(self);
+                \\    const casted: *const {s} = @ptrFromInt(byte_ptr + {d});
+                \\    return casted;
+                \\}}
+            , .{
+                baseClass.name,
+                namespaced,
+                namespaced,
+                base.offset,
+                baseClass.name,
+                namespaced,
+                namespaced,
+                base.offset,
+            });
+        }
+    }
+
+    /// concats all bases into a slice, provides `self` as the first item
+    /// returned memory is owned by caller.
+    pub fn getBases(self: Class, gpa: std.mem.Allocator, data: TokenContainer) ![]Base {
+        var list = try std.ArrayList(Base).initCapacity(gpa, self.bases.len + 1);
+        list.appendAssumeCapacity(.{ .type = self.id, .access = .public, .virtual = false, .offset = 0 });
+        for (self.bases) |value| {
+            const parent = switch (data.find(value.type) orelse return DataSearch.MissingID) {
+                .Struct, .Class => |v| v,
+                else => unreachable,
+            };
+            const more = try parent.getBases(gpa, data);
+            defer gpa.free(more);
+            for (more[1..]) |*item|
+                // accounting for local offset
+                item.offset += more[0].offset;
+
+            try list.appendSlice(gpa, more);
+        }
+        return try list.toOwnedSlice(gpa);
     }
 };
 
@@ -1559,7 +1707,7 @@ fn getTypeSize(token: anytype, data: TokenContainer) DataSearch!?@Tuple(&.{ u64,
         .FundamentalType,
         .Union,
         => |v| v.@"align",
-        else => |v| std.debug.panic("Underlying is type of {s}", .{@typeName(@TypeOf(v))}),
+        else => unreachable,
     };
     const size = switch (underlying) {
         inline .PointerType,
@@ -1569,7 +1717,7 @@ fn getTypeSize(token: anytype, data: TokenContainer) DataSearch!?@Tuple(&.{ u64,
         .FundamentalType,
         .Union,
         => |v| v.size / 8,
-        else => |v| std.debug.panic("Underlying is type of {s}", .{@typeName(@TypeOf(v))}),
+        else => unreachable,
     };
     return .{ size, @"align" };
 }
