@@ -60,3 +60,17 @@ pub fn DeclType(comptime T: type, comptime name: []const u8) type {
         else => |_, t| @compileError("Error, type \"" ++ @typeName(T) ++ "\" is not a struct and is a " ++ @tagName(t)),
     }
 }
+
+pub fn unfurlOptional(
+    T: @Tuple(
+        &.{ type, type },
+    ),
+    optionalTuple: ?T,
+) @Tuple(
+    &.{
+        ?T.@"0",
+        ?T.@"1",
+    },
+) {
+    return if (optionalTuple) |v| .{ v.@"0", v.@"1" } else null;
+}

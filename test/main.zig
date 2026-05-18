@@ -1,15 +1,14 @@
 const std = @import("std");
 const Testing = @import("testing");
 
-export fn callstack() callconv(.c) void {}
-
 pub fn main() !void {
     var t = Testing.Foo.Test2.init0();
+    var j = Testing.Foo.@"Test<Bar>".init0();
+    defer j.deinit();
+
+    _ = j.testingFunction.testingFunctiond(30);
     defer t.deinit();
-    inline for (@typeInfo(@TypeOf(t)).@"struct".fields) |field| {
-        const fval = @field(t, field.name);
-        std.log.debug("t.{s}: {any}", .{ field.name, fval });
-    }
     t.testingFunction(30);
+    _ = Testing.sum.sumff(30, 30);
     _ = Testing.sum.sumdd(30, 30);
 }

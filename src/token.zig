@@ -3,6 +3,24 @@ const debug = std.debug;
 const TokenContainer = @import("container.zig");
 const util = @import("util.zig");
 
+/// prints out the types of a function
+pub fn generateTypeSig(f: anytype, gpa: std.mem.Allocator, data: TokenContainer) ![]u8 {
+    comptime {
+        debug.assert(@hasField(@TypeOf(f), "arguments"));
+    }
+
+    var writer: std.Io.Writer.Allocating = std.Io.Writer.Allocating.init(gpa);
+    errdefer writer.deinit();
+
+    for (f.arguments) |arg| {
+        const str = try arg.printName(gpa, data);
+        defer gpa.free(str);
+        try writer.writer.print("{s}", .{str});
+    }
+
+    return writer.toOwnedSlice();
+}
+
 const typeMap = std.static_string_map.StaticStringMap(struct { []const u8, enum {
     custom,
     primitive,
@@ -86,6 +104,49 @@ pub const Class = struct {
     bases: []Base = &.{},
     incomplete: bool = false,
 
+    pub const Context = struct {
+        const DataType = std.hash_map.StringHashMapUnmanaged(ClassData);
+        const ClassData = std.hash_map.StringHashMapUnmanaged(MethodData);
+        const MethodData = std.array_list.Aligned([]const u8, null);
+
+        data: DataType,
+
+        pub fn init(gpa: std.mem.Allocator, tokens: TokenContainer) !Context {
+            var data: DataType = .empty;
+
+            for (tokens.get(.Class).values()) |class| {
+                var classData = ClassData.empty;
+                var memberIt = class.memberIterator();
+                while (memberIt.next()) |memberId| {
+                    switch (tokens.find(memberId) orelse continue) {
+                        .Method => |method| {
+                            const r = try classData.getOrPut(gpa, method.name);
+                            if (!r.found_existing) {
+                                r.value_ptr.* = .empty;
+                            }
+                            try r.value_ptr.append(gpa, method.id);
+                        },
+                        else => continue,
+                    }
+                }
+                try data.put(gpa, class.id, classData);
+            }
+            return .{ .data = data };
+        }
+
+        pub fn deinit(self: *Context, gpa: std.mem.Allocator) void {
+            var it = self.data.valueIterator();
+            while (it.next()) |v| {
+                var it2 = v.valueIterator();
+                while (it2.next()) |a| {
+                    a.deinit(gpa);
+                }
+                v.deinit(gpa);
+            }
+            self.data.deinit(gpa);
+        }
+    };
+
     const vtableName = "_vtable";
     const vtableType = "Vtable";
 
@@ -96,7 +157,19 @@ pub const Class = struct {
         offset: u64,
     };
 
-    pub fn write(self: Class, gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
+    pub fn memberIterator(self: Class) std.mem.SplitIterator(u8, .scalar) {
+        return std.mem.splitScalar(u8, self.members, ' ');
+    }
+
+    const selfTag = std.meta.stringToEnum(@"type", util.getBaseName(@This())) orelse unreachable;
+
+    pub fn write(
+        self: Class,
+        gpa: std.mem.Allocator,
+        data: TokenContainer,
+        context: Context,
+        writer: *std.Io.Writer,
+    ) !void {
         if (self.name.len == 0)
             // Ghost class
             return;
@@ -136,14 +209,37 @@ pub const Class = struct {
             try self.writeFields(data, gpa, writer);
         }
 
+        const overloadTableFmt = "overloaded_{s}";
+        // phase 2.5 -> print out overloaded fake members
+        blk: {
+            const map = context.data.get(self.id) orelse {
+                std.log.info("id: {s} not found!", .{self.id});
+                break :blk;
+            };
+
+            var methodIt = map.iterator();
+            while (methodIt.next()) |methods| {
+                if (methods.value_ptr.items.len > 1) {
+                    std.log.debug("found overloaded method named \"{s}\"", .{methods.key_ptr.*});
+                    try writer.print(
+                        \\{s}: 
+                    ++ overloadTableFmt ++
+                        \\,
+                        \\
+                    , .{ methods.key_ptr.*, methods.key_ptr.* });
+                } else {
+                    continue;
+                }
+            }
+        }
+
         // Phase 3 -> print functions
         //
         // part 1: print constructors & destructors
-
         {
-            var memberIterator = std.mem.splitScalar(u8, self.members, ' ');
+            var it = self.memberIterator();
             var initIterator: u64 = 0;
-            while (memberIterator.next()) |member| {
+            while (it.next()) |member| {
                 switch (data.find(member) orelse continue) {
                     .Constructor => |constructor| {
                         switch (constructor.access) {
@@ -211,12 +307,18 @@ pub const Class = struct {
         }
 
         {
-            var memberIterator = std.mem.splitScalar(u8, self.members, ' ');
-            while (memberIterator.next()) |memberID| {
+            const methodData = context.data.get(self.id) orelse return DataSearch.MissingID;
+
+            var it = self.memberIterator();
+            while (it.next()) |memberID| {
                 switch (data.find(memberID) orelse continue) {
                     .Method => |method| {
+                        // we overloaded exception, we manage later
+                        if (methodData.get(method.name)) |v|
+                            if (v.items.len > 1) continue;
                         // inline methods have no labels, so we can't link
                         if (method.@"inline") continue;
+                        // we won't print it, it's internal only
                         if (method.access != .public) continue;
                         const prefix = if (method.@"const") "const " else "";
                         if (method.virtual) {
@@ -231,7 +333,7 @@ pub const Class = struct {
                             try writer.print(
                                 \\) {s} {{
                                 \\    return self.{s}.{s}(self, 
-                            , .{ method.returns, vtableName, method.name });
+                            , .{ method.returns, vtableName, method.mangled });
                             for (method.arguments, 0..) |_, i| {
                                 try writer.print(
                                     \\arg{d},
@@ -267,6 +369,75 @@ pub const Class = struct {
             }
         }
 
+        // funky overloaded function time
+        {
+            const values = context.data.get(self.id) orelse return DataSearch.MissingID;
+            var it = values.iterator();
+            while (it.next()) |v| {
+                if (v.value_ptr.items.len > 1) {
+                    std.log.debug("overloaded found method: {s}", .{v.key_ptr.*});
+                    try writer.print(
+                        "pub const " ++ overloadTableFmt ++ "= extern struct {{ ",
+                        .{v.key_ptr.*},
+                    );
+                    for (v.value_ptr.items) |methodId| {
+                        const method = data.get(.Method).get(methodId) orelse return DataSearch.MissingID;
+                        const prefix = if (method.@"const") "const" else "";
+
+                        try writer.print(
+                            \\extern fn @"{s}"(*{s} {s},
+                        , .{ method.mangled, prefix, self.id });
+                        for (method.arguments) |value| {
+                            try writer.print(
+                                \\ {s}, 
+                            , .{value.type});
+                        }
+                        try writer.print(
+                            \\) callconv(.c) {s};
+                            \\
+                        , .{method.returns});
+
+                        const typeSig = try generateTypeSig(method, gpa, data);
+                        defer gpa.free(typeSig);
+
+                        try writer.print(
+                            \\pub inline fn @"{s}{s}"(self: *{s}
+                        ++ overloadTableFmt ++ ", ", .{
+                            method.name,
+                            typeSig,
+                            prefix,
+                            method.name,
+                        });
+
+                        const argFmt = "arg_{d}";
+
+                        for (method.arguments, 0..) |arg, i| {
+                            try writer.print(argFmt ++
+                                \\: {s},
+                            , .{ i, arg.type });
+                        }
+
+                        try writer.print(
+                            \\) {s} {{
+                            \\  const parent: *{s} @"{s}" = @alignCast(@fieldParentPtr("{s}", self));
+                            \\  return @"{s}"(parent, 
+                        , .{ method.returns, prefix, self.name, method.name, method.mangled });
+                        for (method.arguments, 0..) |_, i|
+                            try writer.print(argFmt ++ ", ", .{i});
+                        try writer.print(
+                            \\);
+                            \\}}
+                            \\
+                        , .{});
+                    }
+                    try writer.print(
+                        \\}};
+                        \\
+                    , .{});
+                }
+            }
+        }
+
         try writer.print("}};\npub const @\"{s}\" = @\"{s}\";\n", .{ self.name, self.id });
     }
 
@@ -274,7 +445,7 @@ pub const Class = struct {
     /// and the inherited members
     /// does *not* print _vtable
     pub fn writeFields(self: Class, data: TokenContainer, gpa: std.mem.Allocator, writer: *std.Io.Writer) (DataSearch || std.Io.Writer.Error || std.mem.Allocator.Error)!void {
-        var memberIterator = std.mem.splitScalar(u8, self.members, ' ');
+        var it = self.memberIterator();
         var privateIterator: u64 = 0;
         for (self.bases) |baseID| {
             const base = data.find(baseID.type) orelse continue;
@@ -296,7 +467,7 @@ pub const Class = struct {
 
         var fieldList = std.ArrayList(Field).empty;
         defer fieldList.deinit(gpa);
-        while (memberIterator.next()) |memberid| {
+        while (it.next()) |memberid| {
             switch (data.find(memberid) orelse continue) {
                 .Field => |f| {
                     try fieldList.append(gpa, f);
@@ -371,7 +542,7 @@ pub const Class = struct {
                         \\@"{s}": *const fn (*{s} @"{s}",
                         \\
                     , .{
-                        m.name,
+                        m.mangled,
                         constStr,
                         self.name,
                     });
@@ -396,8 +567,8 @@ pub const Class = struct {
     /// returns a slice of all the virtual items, sorted
     pub fn compileVirtual(self: Class, gpa: std.mem.Allocator, data: TokenContainer) ![]VirtualUnion {
         var arrList = std.ArrayList(VirtualUnion).empty;
-        var memberIterator = std.mem.splitScalar(u8, self.members, ' ');
-        while (memberIterator.next()) |member| {
+        var it = self.memberIterator();
+        while (it.next()) |member| {
             switch (data.find(member) orelse continue) {
                 inline .Destructor, .Method => |v, t| if (v.virtual) try arrList.append(gpa, @unionInit(VirtualUnion, @tagName(t), v)),
                 else => continue,
@@ -742,7 +913,7 @@ pub const Namespace = struct {
                     for (std.enums.values(@"type"), 0..) |v, i| {
                         if (v == .Namespace)
                             break std.enums.values(@"type")[0..i] ++ std.enums.values(@"type")[i + 1 ..];
-                    } else std.enums.values(@"type");
+                    };
 
                 var names: [values.len][]const u8 = undefined;
                 var types: [values.len]type = undefined;
@@ -773,13 +944,12 @@ pub const Namespace = struct {
         pub fn init(gpa: std.mem.Allocator, data: TokenContainer) !Context {
             var ctx: Context = undefined;
             inline for (@typeInfo(Context.ContextData).@"struct".fields) |fieldInfo| {
-                const field = &@field(ctx.data, fieldInfo.name);
                 const FieldType = fieldInfo.type;
                 switch (@typeInfo(FieldType)) {
                     .@"struct" => {
                         const InitType = util.DeclType(FieldType, "init");
                         if (InitType == FieldType) {
-                            field.* = @field(FieldType, "init");
+                            @field(ctx.data, fieldInfo.name) = @field(FieldType, "init");
                         } else {
                             switch (@typeInfo(InitType)) {
                                 .@"fn" => |func| {
@@ -794,7 +964,6 @@ pub const Namespace = struct {
                                     } else true;
 
                                     if (shouldCare) {
-                                        std.log.debug("Calling init!", .{});
                                         const Args = std.meta.ArgsTuple(InitType);
                                         var a: Args = undefined;
                                         inline for (@typeInfo(InitType).@"fn".params, 0..) |p, i| {
@@ -809,13 +978,13 @@ pub const Namespace = struct {
                                                 if (err.payload != FieldType)
                                                     continue
                                                 else {
-                                                    field.* = try @call(.auto, @field(FieldType, "init"), a);
+                                                    @field(ctx.data, fieldInfo.name) = try @call(.auto, @field(FieldType, "init"), a);
                                                     continue;
                                                 }
                                             },
                                             else => void{},
                                         }
-                                        field.* = @call(.auto, @field(FieldType, "init"), a);
+                                        @field(ctx.data, fieldInfo.name) = @call(.auto, @field(FieldType, "init"), a);
                                     }
                                 },
                                 else => void{},
@@ -1026,6 +1195,7 @@ pub const Function = struct {
         // anon function
         if (self.name.len == 0 or self.@"inline")
             return;
+
         const externName = if (self.mangled.len == 0) self.name else self.mangled;
         const writeAlias = !std.mem.eql(u8, self.mangled, self.name) and self.mangled.len != 0;
         try writer.print(
@@ -1059,20 +1229,6 @@ pub const Function = struct {
                 \\
             , .{});
         }
-    }
-
-    /// prints out the types of the function
-    pub fn generateTypeSig(f: Function, gpa: std.mem.Allocator, data: TokenContainer) ![]u8 {
-        var writer: std.Io.Writer.Allocating = std.Io.Writer.Allocating.init(gpa);
-        errdefer writer.deinit();
-
-        for (f.arguments) |arg| {
-            const str = try arg.printName(gpa, data);
-            defer gpa.free(str);
-            try writer.writer.print("{s}", .{str});
-        }
-
-        return writer.toOwnedSlice();
     }
 };
 

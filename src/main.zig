@@ -4,6 +4,10 @@ const TokenContainer = @import("container.zig");
 const token = @import("token.zig");
 const util = @import("util.zig");
 
+comptime {
+    std.testing.refAllDecls(@This());
+}
+
 /// Caller owns memory
 /// returns the output, and stderr of the program
 fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: []const []const u8) ![]u8 {

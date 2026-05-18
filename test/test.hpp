@@ -9,6 +9,7 @@ class Test {
   public:
     virtual ~Test();
     virtual void testingFunction(double delta);
+    virtual void testingFunction(float delta);
 
     int testingItem;
     int* testingptr;
@@ -33,4 +34,9 @@ class Test2 : public Test<Bar> {
 };  // namespace Foo
 
 float sum(float a, float b);
-float sum(double a, double b);
+double sum(double a, double b);
+template<typename T>
+T sum(T a, T b);
+
+template<>
+int sum<int>(int j, int i);

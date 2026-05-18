@@ -6,10 +6,10 @@ const TokenUnion = token.TokenUnion;
 
 data: Data,
 
-pub const Data: type = EnumMap(token.type);
+pub const Data: type = EnumMap();
 
-fn EnumMap(comptime @"enum": type) type {
-    const count: comptime_int = std.enums.values(@"enum").len;
+fn EnumMap() type {
+    const count: comptime_int = std.enums.values(token.type).len;
     var typeNames: [count][]const u8 = undefined;
     var typeAttrs: [count]std.builtin.Type.StructField.Attributes = undefined;
     var typeTypes: [count]type = undefined;
@@ -40,17 +40,26 @@ pub fn init() TokenContainer {
 pub fn get(self: @This(), comptime t: token.type) std.array_hash_map.String(token.StructType(t)) {
     return @field(self.data, @tagName(t));
 }
-pub fn appendExplicit(self: *@This(), gpa: std.mem.Allocator, comptime t: type, value: token.StructType(t)) !void {
+
+pub fn appendExplicit(
+    self: *@This(),
+    gpa: std.mem.Allocator,
+    comptime t: token.type,
+    value: token.StructType(t),
+) !void {
     return @field(self.data, @tagName(t)).append(gpa, value);
 }
 
 pub fn append(self: *@This(), gpa: std.mem.Allocator, value: anytype) !void {
-    const inType = @TypeOf(value);
-    util.ensure(@hasField(@TypeOf(self.data), util.getBaseName(inType))) catch {
-        @panic("Error! " ++ comptime util.getBaseName(inType) ++ " is not acceptable!");
-    };
+    const InType = @TypeOf(value);
 
-    try @field(self.data, util.getBaseName(inType)).put(gpa, value.id, value);
+    comptime {
+        util.ensure(@hasField(@TypeOf(self.data), util.getBaseName(InType))) catch {
+            @panic("Error! " ++ util.getBaseName(InType) ++ " is not acceptable!");
+        };
+    }
+
+    try @field(self.data, util.getBaseName(InType)).put(gpa, value.id, value);
 }
 
 pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
