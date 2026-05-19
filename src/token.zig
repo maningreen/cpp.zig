@@ -7,6 +7,7 @@ const util = @import("util.zig");
 pub fn generateTypeSig(f: anytype, gpa: std.mem.Allocator, data: TokenContainer) ![]u8 {
     comptime {
         debug.assert(@hasField(@TypeOf(f), "arguments"));
+        debug.assert(@FieldType(@TypeOf(f), "arguments") == []Argument);
     }
 
     var writer: std.Io.Writer.Allocating = std.Io.Writer.Allocating.init(gpa);
@@ -213,7 +214,7 @@ pub const Class = struct {
             \\const {s} = extern struct {{
             \\
         , .{vtableType});
-        const virtualItems: bool = try writeVtableFields(self, gpa, data, writer);
+        const virtualItems: bool = try writeVtableFields(self, gpa, data, context, writer);
         try writer.print(
             \\}};
             \\
@@ -231,7 +232,7 @@ pub const Class = struct {
         }
 
         // phase 2.5 -> print out overloaded fake members
-        // try self.writeOverloadFields(data, context, writer);
+        try self.writeOverloadFields(gpa, data, context, writer);
 
         // Phase 3 -> print functions
         //
@@ -307,58 +308,9 @@ pub const Class = struct {
         }
 
         {
-            const methodData = context.data.get(self.id) orelse return DataSearch.MissingID;
-
             var it = self.memberIterator();
             while (it.next()) |memberID| {
                 switch (data.find(memberID) orelse continue) {
-                    .Method => |method| {
-                        // we overloaded exception, we manage later
-                        if (methodData.get(method.name)) |v|
-                            if (v.items.len > 1) continue;
-                        // inline methods have no labels, so we can't link
-                        if (method.@"inline") continue;
-                        // we won't print it, it's internal only
-                        if (method.access != .public) continue;
-                        const prefix = if (method.@"const") "const " else "";
-                        if (context.overloadCount(data, self.id, method.name) orelse 0 > 1) continue;
-                        if (method.virtual) {
-                            try writer.print(
-                                \\pub fn {s}(self: *{s}@This(),
-                            , .{ method.name, prefix });
-                            for (method.arguments, 0..) |arg, i| {
-                                try writer.print(
-                                    \\arg{d}: {s}, 
-                                , .{ i, arg.type });
-                            }
-                            try writer.print(
-                                \\) {s} {{
-                                \\    return self.{s}.{s}(self, 
-                            , .{ method.returns, vtableName, method.mangled });
-                            for (method.arguments, 0..) |_, i| {
-                                try writer.print(
-                                    \\arg{d},
-                                , .{i});
-                            }
-                            try writer.print(
-                                \\);
-                                \\}}
-                                \\
-                            , .{});
-                        } else {
-                            try writer.print(
-                                \\extern "c" fn @"{s}" (*{s}@This(), 
-                            , .{ method.mangled, prefix });
-                            for (method.arguments) |arg| {
-                                try writer.print("{s}, ", .{arg.type});
-                            }
-                            try writer.print(
-                                \\) {s};
-                                \\pub const @"{s}" = {s};
-                                \\
-                            , .{ method.returns, method.name, method.mangled });
-                        }
-                    },
                     .Typedef => |td| {
                         const name = try namespacedType(td.type, data, gpa) orelse continue;
                         defer gpa.free(name);
@@ -369,9 +321,61 @@ pub const Class = struct {
                 }
             }
         }
+        {
+            const methodData = context.data.get(self.id) orelse return DataSearch.MissingID;
+            const methods = try self.concatMethods(gpa, data, context);
+            defer gpa.free(methods);
+            for (methods) |method| {
+                // we overloaded exception, we manage later
+                if (methodData.get(method.name)) |v|
+                    if (v.items.len > 1) continue;
+                // inline methods have no labels, so we can't link
+                if (method.@"inline") continue;
+                // we won't print it, it's internal only
+                if (method.access != .public) continue;
+                const prefix = if (method.@"const") "const " else "";
+                if (context.overloadCount(data, self.id, method.name) orelse 0 > 1) continue;
+                if (method.virtual) {
+                    try writer.print(
+                        \\pub inline fn {s}(self: *{s}@This(),
+                    , .{ method.name, prefix });
+                    for (method.arguments, 0..) |arg, i| {
+                        try writer.print(
+                            \\arg{d}: {s}, 
+                        , .{ i, arg.type });
+                    }
+                    try writer.print(
+                        \\) {s} {{
+                        \\    return self.{s}.{s}(self, 
+                    , .{ method.returns, vtableName, method.mangled });
+                    for (method.arguments, 0..) |_, i| {
+                        try writer.print(
+                            \\arg{d},
+                        , .{i});
+                    }
+                    try writer.print(
+                        \\);
+                        \\}}
+                        \\
+                    , .{});
+                } else {
+                    try writer.print(
+                        \\extern "c" fn @"{s}" (*{s}@This(), 
+                    , .{ method.mangled, prefix });
+                    for (method.arguments) |arg| {
+                        try writer.print("{s}, ", .{arg.type});
+                    }
+                    try writer.print(
+                        \\) {s};
+                        \\pub const @"{s}" = {s};
+                        \\
+                    , .{ method.returns, method.name, method.mangled });
+                }
+            }
+        }
 
         // funky overloaded function time
-        // try self.writeOverloadStructs(data, gpa, context, writer);
+        try self.writeOverloadStructs(gpa, data, context, writer);
 
         try self.writeParentCastFunctions(gpa, data, writer);
 
@@ -456,8 +460,8 @@ pub const Class = struct {
     /// ```
     /// returns whether or not it wrote anything, for a class without virtual members,
     /// simply returns false,
-    pub fn writeVtableFields(self: Class, gpa: std.mem.Allocator, data: TokenContainer, writer: *std.Io.Writer) !bool {
-        const items = try compileVirtual(self, gpa, data);
+    pub fn writeVtableFields(self: Class, gpa: std.mem.Allocator, data: TokenContainer, ctx: Context, writer: *std.Io.Writer) !bool {
+        const items = try compileVirtual(self, gpa, data, ctx);
         defer gpa.free(items);
 
         if (items.len == 0)
@@ -502,17 +506,25 @@ pub const Class = struct {
     };
 
     /// returns a slice of all the virtual items, sorted
-    pub fn compileVirtual(self: Class, gpa: std.mem.Allocator, data: TokenContainer) ![]VirtualUnion {
+    pub fn compileVirtual(self: Class, gpa: std.mem.Allocator, data: TokenContainer, ctx: Context) ![]VirtualUnion {
         var arrList = std.ArrayList(VirtualUnion).empty;
         var it = self.memberIterator();
         while (it.next()) |member| {
             switch (data.find(member) orelse continue) {
-                inline .Destructor, .Method => |v, t| if (v.virtual) try arrList.append(gpa, @unionInit(VirtualUnion, @tagName(t), v)),
+                .Destructor,
+                => |v| if (v.virtual) try arrList.append(gpa, .{ .Destructor = v }),
                 else => continue,
             }
         }
 
-        if (arrList.items.len == 0) return try arrList.toOwnedSlice(gpa);
+        const methods = try self.concatMethods(gpa, data, ctx);
+        defer gpa.free(methods);
+        for (methods) |val| {
+            if (val.virtual)
+                try arrList.append(gpa, .{ .Method = val });
+        }
+
+        if (arrList.items.len == 0) return arrList.toOwnedSlice(gpa) catch unreachable;
 
         const cmp = struct {
             pub fn lt(_: void, aP: VirtualUnion, bP: VirtualUnion) bool {
@@ -546,33 +558,28 @@ pub const Class = struct {
     ///   myFunc: (overloadTableFmt)
     /// ```
     /// where `(overloadTableFmt)` is the format for overload tables, with `"myFunc"` as the item
-    pub fn writeOverloadFields(self: Class, data: TokenContainer, ctx: Context, out: *std.Io.Writer) (DataSearch || std.Io.Writer.Error)!void {
-        for (self.bases) |base| {
-            switch (base.access) {
-                .public => {
-                    switch (data.find(base.type) orelse continue) {
-                        .Struct, .Class => |v| try v.writeOverloadFields(data, ctx, out),
-                        else => continue,
-                    }
-                },
-                else => continue,
+    pub fn writeOverloadFields(
+        self: Class,
+        gpa: std.mem.Allocator,
+        data: TokenContainer,
+        ctx: Context,
+        out: *std.Io.Writer,
+    ) (DataSearch || std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        var methods = try compileMethods(self, gpa, data, ctx);
+        defer methods.deinit(gpa);
+
+        var it = methods.iterator();
+        while (it.next()) |entry| {
+            defer entry.value_ptr.deinit(gpa);
+
+            if (entry.value_ptr.items.len > 1) {
+                try out.print(
+                    \\{s}: 
+                ++ overloadTableFmt ++
+                    \\,
+                    \\
+                , .{ entry.key_ptr.*, entry.key_ptr.* });
             }
-        }
-
-        const selfData = ctx.data.get(self.id) orelse return DataSearch.MissingID;
-        var it = selfData.iterator();
-        while (it.next()) |methods| {
-            if (methods.value_ptr.items.len < 2)
-                // not overloaded, continue
-                continue;
-
-            std.log.debug("found overloaded method named \"{s}\"", .{methods.key_ptr.*});
-            try out.print(
-                \\{s}: 
-            ++ overloadTableFmt ++
-                \\,
-                \\
-            , .{ methods.key_ptr.*, methods.key_ptr.* });
         }
     }
 
@@ -587,7 +594,7 @@ pub const Class = struct {
     /// ```
     /// the following would be written to the inputted writer
     /// ```zig
-    /// pub const (overloadTableFmt) = packed struct (void) {
+    /// pub const (overloadTableFmt) = extern struct {
     ///     pub inline fn myFunci(self: *(overloadTableFmt), arg_0: i) void {
     ///          const parent = @as((MyClass.id), @fieldParentPtr("myFunc", self));
     ///          return _ZN7MyClass6myFuncEi(parent, arg_0);
@@ -601,84 +608,111 @@ pub const Class = struct {
     /// }
     /// ```
     /// where `(overloadTableFmt)` is the format for overload tables, with `"myFunc"` as the item
-    pub fn writeOverloadStructs(self: Class, data: TokenContainer, gpa: std.mem.Allocator, ctx: Context, out: *std.Io.Writer) !void {
-        for (self.bases) |base| {
-            switch (base.access) {
-                .public => {
-                    switch (data.find(base.type) orelse continue) {
-                        .Class, .Struct => |s| {
-                            try s.writeOverloadStructs(data, gpa, ctx, out);
-                        },
-                        else => continue,
-                    }
-                },
-                else => continue,
-            }
+    pub fn writeOverloadStructs(
+        self: Class,
+        gpa: std.mem.Allocator,
+        data: TokenContainer,
+        ctx: Context,
+        out: *std.Io.Writer,
+    ) (DataSearch || std.mem.Allocator.Error || std.Io.Writer.Error || Argument.PrintError)!void {
+        var methods = try self.compileMethods(gpa, data, ctx);
+        defer {
+            defer methods.deinit(gpa);
+            var it = methods.valueIterator();
+            while (it.next()) |v|
+                v.deinit(gpa);
         }
-        const values = ctx.data.get(self.id) orelse return DataSearch.MissingID;
-        var it = values.iterator();
-        while (it.next()) |v| {
-            if (v.value_ptr.items.len > 1) {
-                std.log.debug("overloaded found method: {s}", .{v.key_ptr.*});
+        var it = methods.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.items.len < 2) {
+                std.log.debug("Skipping non-overloaded function {s}, {d} options", .{ entry.key_ptr.*, entry.value_ptr.items.len });
+                continue;
+            }
+            // overload
+            try out.print(
+                \\pub const 
+            ++ overloadTableFmt ++
+                \\ = extern struct {{
+                \\
+            , .{entry.key_ptr.*});
+            for (entry.value_ptr.items) |methodId| {
+                const method = data.get(.Method).get(methodId) orelse return DataSearch.MissingID;
+                const sig = try generateTypeSig(method, gpa, data);
+                const prefix = if (method.@"const") "const " else "";
+                defer gpa.free(sig);
+                //     pub inline fn myFunci(self: *(overloadTableFmt), arg_0: i) void {
+                //          const parent = @as(*(MyClass.id), @fieldParentPtr("myFunc", self));
+                //          return _ZN7MyClass6myFuncEi(parent, arg_0);
+                //     }
                 try out.print(
-                    "pub const " ++ overloadTableFmt ++ " = extern struct {{\n",
-                    .{v.key_ptr.*},
-                );
-                for (v.value_ptr.items) |methodId| {
-                    const method = data.get(.Method).get(methodId) orelse return DataSearch.MissingID;
-                    const prefix = if (method.@"const") "const" else "";
+                    \\pub inline fn 
+                ++ overloadTableFmt ++
+                    \\{s}(self: *{s}
+                ++ overloadTableFmt ++
+                    \\, 
+                , .{ method.name, sig, prefix, method.name });
 
+                for (method.arguments, 0..) |arg, i| {
                     try out.print(
-                        \\extern fn @"{s}"(*{s} {s},
-                    , .{ method.mangled, prefix, self.id });
-                    for (method.arguments) |value| {
-                        try out.print(
-                            \\ {s}, 
-                        , .{value.type});
-                    }
-                    try out.print(
-                        \\) callconv(.c) {s};
+                        \\arg_{d}: {s},
                         \\
-                    , .{method.returns});
-
-                    const typeSig = try generateTypeSig(method, gpa, data);
-                    defer gpa.free(typeSig);
-
-                    try out.print(
-                        \\pub inline fn @"{s}{s}"(self: *{s}
-                    ++ overloadTableFmt ++ ", ", .{
-                        method.name,
-                        typeSig,
-                        prefix,
-                        method.name,
+                    , .{
+                        i,
+                        arg.type,
                     });
+                }
 
-                    const argFmt = "arg_{d}";
-
-                    for (method.arguments, 0..) |arg, i| {
-                        try out.print(argFmt ++
-                            \\: {s},
-                        , .{ i, arg.type });
-                    }
-
+                if (method.virtual) {
                     try out.print(
                         \\) {s} {{
-                        \\  const parent: *{s} @"{s}" = @fieldParentPtr("{s}", self);
-                        \\  return @"{s}"(@alignCast(@ptrCast(parent)), 
-                    , .{ method.returns, prefix, self.name, method.name, method.mangled });
-                    for (method.arguments, 0..) |_, i|
-                        try out.print(argFmt ++ ", ", .{i});
+                        \\    const parent = @as(*{s}{s}, @alignCast(@fieldParentPtr("{s}", self)));
+                        \\    return parent.{s}.{s}(parent, 
+                    , .{
+                        method.returns,
+                        prefix,
+                        self.name,
+                        method.name,
+                        vtableName,
+                        method.mangled,
+                    });
+                } else {
                     try out.print(
-                        \\);
-                        \\}}
+                        \\) {s} {{
+                        \\    const parent = @as(*{s}{s}, @alignCast(@fieldParentPtr("{s}", self)));
+                        \\    return @"{s}"(parent, 
+                    , .{
+                        method.returns,
+                        prefix,
+                        self.name,
+                        method.name,
+                        method.mangled,
+                    });
+                }
+                for (method.arguments, 0..) |_, i| {
+                    try out.print(
+                        \\arg_{d},
                         \\
-                    , .{});
+                    , .{
+                        i,
+                    });
                 }
                 try out.print(
-                    \\}};
+                    \\);
+                    \\}}
                     \\
                 , .{});
+                try out.print(
+                    \\extern "c" fn @"{s}" (*{s}{s}, 
+                , .{ method.mangled, prefix, self.name });
+                for (method.arguments) |arg| {
+                    try out.print("{s}, ", .{arg.type});
+                }
+                try out.print(
+                    \\) {s};
+                    \\
+                , .{method.returns});
             }
+            try out.print("}};\n", .{});
         }
     }
 
@@ -724,10 +758,12 @@ pub const Class = struct {
 
     /// concats all bases into a slice, provides `self` as the first item
     /// returned memory is owned by caller.
+    /// ignores private bases & methods
     pub fn getBases(self: Class, gpa: std.mem.Allocator, data: TokenContainer) ![]Base {
         var list = try std.ArrayList(Base).initCapacity(gpa, self.bases.len + 1);
         list.appendAssumeCapacity(.{ .type = self.id, .access = .public, .virtual = false, .offset = 0 });
         for (self.bases) |value| {
+            if (value.access != .public) continue;
             const parent = switch (data.find(value.type) orelse return DataSearch.MissingID) {
                 .Struct, .Class => |v| v,
                 else => unreachable,
@@ -741,6 +777,81 @@ pub const Class = struct {
             try list.appendSlice(gpa, more);
         }
         return try list.toOwnedSlice(gpa);
+    }
+
+    /// Creates a classData for all of the inherited and builtin methods
+    /// provides all methods
+    pub fn compileMethods(self: Class, gpa: std.mem.Allocator, data: TokenContainer, ctx: Context) !Context.ClassData {
+        const bases = try self.getBases(gpa, data);
+        defer gpa.free(bases);
+
+        var methods = std.array_hash_map.String(Method).empty;
+        defer methods.deinit(gpa);
+        for (bases) |baseVal| {
+            const base = switch (data.find(baseVal.type) orelse return DataSearch.MissingID) {
+                .Struct, .Class => |v| v,
+                else => unreachable,
+            };
+            const classData = ctx.data.get(base.id) orelse return DataSearch.MissingID;
+            var cit = classData.iterator();
+            while (cit.next()) |arr| {
+                for (arr.value_ptr.items) |id| {
+                    const val = data.get(.Method).get(id) orelse unreachable;
+                    try methods.put(gpa, id, val);
+                }
+            }
+        }
+        var i: usize = 0;
+        while (i < methods.count()) {
+            const item = &methods.values()[i];
+            if (item.overrides) |ov| {
+                const ovI = methods.getIndex(ov) orelse unreachable;
+                if (ovI < i) {
+                    // double swap pop
+                    const ovItem = methods.getPtr(ov) orelse return DataSearch.MissingID;
+                    ovItem.* = item.*;
+                    methods.swapRemoveAt(i);
+                    continue;
+                } else {
+                    // simple swap pop
+                    methods.swapRemoveAt(ovI);
+                }
+            }
+            i += 1;
+        }
+        try methods.reIndex(gpa);
+
+        var ret = Context.ClassData.empty;
+        try ret.ensureTotalCapacity(gpa, @truncate(methods.count()));
+        for (methods.values()) |method| {
+            const result = ret.getOrPut(gpa, method.name) catch unreachable;
+            if (!result.found_existing) result.value_ptr.* = .empty;
+            try result.value_ptr.append(gpa, method.id);
+        }
+        return ret;
+    }
+
+    pub fn concatMethods(self: Class, gpa: std.mem.Allocator, data: TokenContainer, ctx: Context) ![]Method {
+        var methods = try self.compileMethods(gpa, data, ctx);
+        defer methods.deinit(gpa);
+        var sigma: usize = 0;
+        {
+            var i = methods.iterator();
+            while (i.next()) |e|
+                sigma += e.value_ptr.items.len;
+        }
+        var construction = try std.ArrayList(Method).initCapacity(gpa, sigma);
+        {
+            var i = methods.iterator();
+            while (i.next()) |e| {
+                for (e.value_ptr.items) |item| {
+                    const value = data.get(.Method).get(item) orelse return DataSearch.MissingID;
+                    construction.appendAssumeCapacity(value);
+                }
+                e.value_ptr.deinit(gpa);
+            }
+        }
+        return construction.toOwnedSlice(gpa);
     }
 };
 
