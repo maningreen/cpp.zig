@@ -22,6 +22,60 @@ pub fn generateTypeSig(f: anytype, gpa: std.mem.Allocator, data: TokenContainer)
     return writer.toOwnedSlice();
 }
 
+fn writeMangledArguments(
+    args: []const Argument,
+    gpa: std.mem.Allocator,
+    data: TokenContainer,
+) (DataSearch || std.mem.Allocator.Error || std.Io.Writer.Error)![]u8 {
+    var writer = std.Io.Writer.Allocating.init(gpa);
+
+    for (args) |arg| {
+        var argType: []const u8 = arg.type;
+        while (true) {
+            switch ((data.find(argType) orelse {
+                std.log.err("missing id: {s}", .{argType});
+                return DataSearch.MissingID;
+            })) {
+                .FundamentalType => |fund| {
+                    const value = typeMap.get(fund.name) orelse debug.panic("reached invalid type: {s}", .{fund.name});
+                    try writer.writer.print("{s}", .{value.@"0"});
+                    break;
+                },
+                inline .ArrayType, .PointerType => |ptr| {
+                    try writer.writer.print("P", .{});
+                    argType = ptr.type;
+                },
+                .ReferenceType => |ref| {
+                    try writer.writer.print("R", .{});
+                    argType = ref.type;
+                },
+                inline .Union, .Class, .Struct => |cplx| {
+                    try writer.writer.print("{d}{s}", .{ cplx.name.len, cplx.name });
+                    break;
+                },
+                .CvQualifiedType => |cv| {
+                    try writer.writer.print("{s}", .{if (cv.@"const") "K" else ""});
+                    argType = cv.type;
+                },
+                .FunctionType => |f| {
+                    const t = try f.writeMangledTypeSig(gpa, data);
+                    defer gpa.free(t);
+                    try writer.writer.print("{s}", .{t});
+                },
+                inline .ElaboratedType, .Typedef => |td| {
+                    argType = td.type;
+                },
+                else => |_, tag| std.debug.panic("Reached invalid argument of type {s}", .{@tagName(tag)}),
+            }
+        }
+    } else {
+        // the only way to get here is if there're no arguments
+        // we break from every other case
+        try writer.writer.print(comptime typeMap.get("void").?.@"0", .{});
+    }
+    return writer.toOwnedSlice();
+}
+
 const typeMap = std.static_string_map.StaticStringMap(struct { []const u8, enum {
     custom,
     primitive,
@@ -59,6 +113,7 @@ pub const Access = enum {
     private,
     protected,
 };
+
 pub const @"type" = enum {
     Method,
     Class,
@@ -69,6 +124,7 @@ pub const @"type" = enum {
     Enumeration,
     PointerType,
     ReferenceType,
+    RValueReferenceType,
     Destructor,
     Namespace,
     Typedef,
@@ -79,6 +135,7 @@ pub const @"type" = enum {
     ElaboratedType,
     Union,
     AtomicType,
+    FunctionType,
 };
 
 pub const Method = struct {
@@ -192,28 +249,22 @@ pub const Class = struct {
         context: Context,
         writer: *std.Io.Writer,
     ) !void {
-        if (self.name.len == 0)
-            // Ghost class
-            return;
-
         if (self.incomplete) return;
+
         try writer.print(
             \\const @"{s}" = extern struct {{
             \\
         , .{self.id});
-
-        var fields = std.ArrayList([]const u8).empty;
-        defer fields.deinit(gpa);
 
         // 1 -> generate a vtable structure
         // 2 -> print fields
         // 3 -> print callables (and virtuals)
 
         // Stage 1 -> generate a vtable.
-        try writer.print(
-            \\const {s} = extern struct {{
+        try writer.print(std.fmt.comptimePrint(
+            \\const {s} = extern struct {{{{
             \\
-        , .{vtableType});
+        , .{vtableType}), .{});
         const virtualItems: bool = try writeVtableFields(self, gpa, data, context, writer);
         try writer.print(
             \\}};
@@ -223,7 +274,7 @@ pub const Class = struct {
         // Phase 2 -> print fields
         {
             if (virtualItems) {
-                try writer.print("{s}: *const {s},\n", .{
+                try writer.print("{s}: *const @\"{s}\",\n", .{
                     vtableName,
                     vtableType,
                 });
@@ -379,7 +430,13 @@ pub const Class = struct {
 
         try self.writeParentCastFunctions(gpa, data, writer);
 
-        try writer.print("}};\npub const @\"{s}\" = @\"{s}\";\n", .{ self.name, self.id });
+        try writer.print("}};\n", .{});
+        if (self.name.len != 0) {
+            try writer.print(
+                \\pub const @"{s}" = @"{s}";
+                \\
+            , .{ self.name, self.id });
+        }
     }
 
     /// prints out all of the fields of the class,
@@ -434,7 +491,7 @@ pub const Class = struct {
                 privateIterator += 1;
             } else switch (field.access) {
                 .public => {
-                    try writer.print("{s}: {s},\n", .{ field.name, field.type });
+                    try writer.print("@\"{s}\": {s},\n", .{ field.name, field.type });
                 },
                 .protected, .private => {
                     const size, const alignment =
@@ -469,7 +526,8 @@ pub const Class = struct {
 
         for (items) |item| {
             switch (item) {
-                .Destructor => {
+                .Destructor => |d| {
+                    debug.assert(d.virtual);
                     try writer.print(
                         \\destruct: *const fn (*const @"{s}") callconv(.c) void,
                         \\delete: *const fn (*const @"{s}") callconv(.c) void,
@@ -477,6 +535,7 @@ pub const Class = struct {
                     , .{ self.name, self.name });
                 },
                 .Method => |m| {
+                    debug.assert(m.virtual);
                     const constStr = if (m.@"const") "const" else "";
 
                     try writer.print(
@@ -508,6 +567,7 @@ pub const Class = struct {
     /// returns a slice of all the virtual items, sorted
     pub fn compileVirtual(self: Class, gpa: std.mem.Allocator, data: TokenContainer, ctx: Context) ![]VirtualUnion {
         var arrList = std.ArrayList(VirtualUnion).empty;
+        errdefer arrList.deinit(gpa);
         var it = self.memberIterator();
         while (it.next()) |member| {
             switch (data.find(member) orelse continue) {
@@ -574,7 +634,7 @@ pub const Class = struct {
 
             if (entry.value_ptr.items.len > 1) {
                 try out.print(
-                    \\{s}: 
+                    \\@"{s}": 
                 ++ overloadTableFmt ++
                     \\,
                     \\
@@ -625,7 +685,6 @@ pub const Class = struct {
         var it = methods.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.items.len < 2) {
-                std.log.debug("Skipping non-overloaded function {s}, {d} options", .{ entry.key_ptr.*, entry.value_ptr.items.len });
                 continue;
             }
             // overload
@@ -645,9 +704,9 @@ pub const Class = struct {
                 //          return _ZN7MyClass6myFuncEi(parent, arg_0);
                 //     }
                 try out.print(
-                    \\pub inline fn 
+                    \\pub inline fn @"
                 ++ overloadTableFmt ++
-                    \\{s}(self: *{s}
+                    \\{s}"(self: *{s}
                 ++ overloadTableFmt ++
                     \\, 
                 , .{ method.name, sig, prefix, method.name });
@@ -665,7 +724,7 @@ pub const Class = struct {
                 if (method.virtual) {
                     try out.print(
                         \\) {s} {{
-                        \\    const parent = @as(*{s}{s}, @alignCast(@fieldParentPtr("{s}", self)));
+                        \\    const parent = @as(*{s}@"{s}", @alignCast(@fieldParentPtr("{s}", self)));
                         \\    return parent.{s}.{s}(parent, 
                     , .{
                         method.returns,
@@ -678,7 +737,7 @@ pub const Class = struct {
                 } else {
                     try out.print(
                         \\) {s} {{
-                        \\    const parent = @as(*{s}{s}, @alignCast(@fieldParentPtr("{s}", self)));
+                        \\    const parent = @as(*{s}@"{s}", @alignCast(@fieldParentPtr("{s}", self)));
                         \\    return @"{s}"(parent, 
                     , .{
                         method.returns,
@@ -702,7 +761,7 @@ pub const Class = struct {
                     \\
                 , .{});
                 try out.print(
-                    \\extern "c" fn @"{s}" (*{s}{s}, 
+                    \\extern "c" fn @"{s}" (*{s}@"{s}", 
                 , .{ method.mangled, prefix, self.name });
                 for (method.arguments) |arg| {
                     try out.print("{s}, ", .{arg.type});
@@ -805,19 +864,19 @@ pub const Class = struct {
         while (i < methods.count()) {
             const item = &methods.values()[i];
             if (item.overrides) |ov| {
-                const ovI = methods.getIndex(ov) orelse unreachable;
-                if (ovI < i) {
-                    // double swap pop
-                    const ovItem = methods.getPtr(ov) orelse return DataSearch.MissingID;
-                    ovItem.* = item.*;
-                    methods.swapRemoveAt(i);
+                const ovI = methods.getIndex(ov) orelse {
+                    item.overrides = null;
                     continue;
+                };
+                if (ovI < i) {
+                    item.overrides = methods.get(ov).?.overrides;
                 } else {
                     // simple swap pop
-                    methods.swapRemoveAt(ovI);
+                    item.overrides = (methods.get(ov) orelse return DataSearch.MissingID).overrides;
+                    _ = methods.orderedRemove(ov);
+                    i += 1;
                 }
-            }
-            i += 1;
+            } else i += 1;
         }
         try methods.reIndex(gpa);
 
@@ -981,42 +1040,9 @@ pub const Constructor = struct {
             try mangledName.writer.print("{d}{s}", .{ parent.len, parent });
         }
         try mangledName.writer.print("C{d}E", .{constructorIndex + 1});
-        for (self.arguments) |arg| {
-            var t: []const u8 = arg.type;
-            while (true) {
-                switch ((data.find(t) orelse return DataSearch.MissingID)) {
-                    .FundamentalType => |fund| {
-                        const value = typeMap.get(fund.name) orelse debug.panic("reached invalid type: {s}", .{fund.name});
-                        try mangledName.writer.print("{s}", .{value.@"0"});
-                        break;
-                    },
-                    inline .ArrayType, .PointerType => |ptr| {
-                        try mangledName.writer.print("P", .{});
-                        t = ptr.type;
-                    },
-                    .ReferenceType => |ref| {
-                        try mangledName.writer.print("R", .{});
-                        t = ref.type;
-                    },
-                    inline .Union, .Class, .Struct => |cplx| {
-                        try mangledName.writer.print("{d}{s}", .{ cplx.name.len, cplx.name });
-                        break;
-                    },
-                    .CvQualifiedType => |cv| {
-                        try mangledName.writer.print("{s}", .{if (cv.@"const") "K" else ""});
-                        t = cv.type;
-                    },
-                    inline .ElaboratedType, .Typedef => |td| {
-                        t = td.type;
-                    },
-                    else => |_, tag| std.debug.panic("Reached invalid argument of type {s}", .{@tagName(tag)}),
-                }
-            }
-        } else {
-            // the only way to get here is if there're no arguments
-            // we break from every other case
-            try mangledName.writer.print(comptime typeMap.get("void").?.@"0", .{});
-        }
+        const args = try writeMangledArguments(self.arguments, gpa, data);
+        defer gpa.free(args);
+        try mangledName.writer.print("{s}", .{args});
         return mangledName.toOwnedSlice();
     }
 };
@@ -1065,8 +1091,8 @@ pub const Enumeration = struct {
 pub const PointerType = struct {
     id: []u8,
     type: []u8,
-    size: u64,
-    @"align": u64,
+    size: u64 = 8,
+    @"align": u64 = 8,
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
@@ -1085,6 +1111,8 @@ pub const ReferenceType = struct {
         try writer.print("const {s} = *{s}; //ref type\n", .{ self.id, name });
     }
 };
+
+pub const RValueReferenceType = ReferenceType;
 
 pub const Destructor = struct {
     id: []u8,
@@ -1148,8 +1176,8 @@ pub const Destructor = struct {
         }
         try mangledName.writer.print(totalSuffix, .{});
 
-        try writer.print("pub const deinit = {s};\n", .{mangledName.writer.buffered()});
-        try writer.print("extern \"c\" fn {s}(*@This()) void;\n", .{mangledName.writer.buffered()});
+        try writer.print("pub const deinit = @\"{s}\";\n", .{mangledName.writer.buffered()});
+        try writer.print("extern \"c\" fn @\"{s}\"(*@This()) void;\n", .{mangledName.writer.buffered()});
     }
 };
 
@@ -1276,6 +1304,7 @@ pub const Namespace = struct {
 
     pub fn write(selfM: ?@This(), gpa: std.mem.Allocator, data: TokenContainer, ctx: Context, writer: *std.Io.Writer) !void {
         const members = comptime [_]@"type"{
+            .ElaboratedType,
             .FundamentalType,
             .ArrayType,
             .CvQualifiedType,
@@ -1353,15 +1382,47 @@ pub const Namespace = struct {
 
 pub const Typedef = struct {
     id: []u8,
-    name: []u8,
+    name: []u8 = "",
     type: []u8,
     context: []u8,
 
-    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
-        _ = gpa;
-        _ = data;
-        _ = self;
-        _ = writer;
+    /// This Context is specifically for the following case
+    /// ```cpp
+    /// typedef struct {
+    ///
+    /// } MyStruct;
+    /// ```
+    pub const Context = struct {
+        structures: std.hash_map.StringHashMapUnmanaged(void),
+
+        pub fn init(gpa: std.mem.Allocator, data: TokenContainer) !Context {
+            var set = std.hash_map.StringHashMapUnmanaged(void).empty;
+            const members = [_]@"type"{ .Struct, .Class };
+            inline for (members) |member|
+                for (data.get(member).values()) |v|
+                    try set.put(gpa, v.name, void{});
+            return .{ .structures = set };
+        }
+
+        pub fn deinit(self: *Context, gpa: std.mem.Allocator) void {
+            self.structures.deinit(gpa);
+        }
+    };
+
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, ctx: Context, writer: *std.Io.Writer) !void {
+        _ = .{ data, gpa };
+        if (ctx.structures.get(self.name)) |_| {
+            try writer.print(
+                \\const {s} = {s};
+                \\
+            , .{ self.id, self.name });
+        } else {
+            try writer.print(
+                \\pub const {s} = {s};
+                \\const {s} = {s};
+                \\
+            , .{ self.name, self.type, self.id, self.name });
+        }
     }
 };
 
@@ -1369,7 +1430,7 @@ pub const ArrayType = struct {
     id: []u8,
     type: []u8,
     min: u64,
-    max: ?u64,
+    max: ?u64 = null,
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
         _ = gpa;
         _ = data;
@@ -1419,6 +1480,7 @@ pub const Function = struct {
         pub fn init(data: TokenContainer, gpa: std.mem.Allocator) !Context {
             var self = std.hash_map.StringHashMap(std.ArrayList([]const u8)).init(gpa);
             for (data.get(.Function).values()) |*func| {
+                if (!func.hasLabel()) continue;
                 const value = try self.getOrPut(func.name);
                 if (value.found_existing) {
                     try value.value_ptr.append(gpa, func.id);
@@ -1439,21 +1501,26 @@ pub const Function = struct {
     };
 
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, ctx: Context, writer: *std.Io.Writer) !void {
-        const fns = ctx.data.get(self.name) orelse unreachable;
-        const overloaded: bool = (fns).items.len > 1;
+        // anon function
+        if (!self.hasLabel())
+            return;
+
+        const fns = ctx.data.get(self.name) orelse {
+            std.log.debug("function named {s}", .{self.name});
+            unreachable;
+        };
+        const overloaded: bool = fns.items.len > 1;
+
+        if (overloaded)
+            std.log.debug("function {s} {d} overloads", .{ self.name, fns.items.len });
 
         // if first overloaded item
         if (overloaded and std.mem.eql(u8, fns.items[0], self.id)) {
-            std.log.debug("Initial, writing {s}", .{self.name});
             try writer.print(
                 \\pub const {s} = struct {{
                 \\
             , .{self.name});
         }
-
-        // anon function
-        if (self.name.len == 0 or self.@"inline")
-            return;
 
         const externName = if (self.mangled.len == 0) self.name else self.mangled;
         const writeAlias = !std.mem.eql(u8, self.mangled, self.name) and self.mangled.len != 0;
@@ -1481,13 +1548,16 @@ pub const Function = struct {
             , .{ self.name, append, self.mangled });
 
         // if last overloaded item
-        if (overloaded and std.mem.eql(u8, fns.items[fns.items.len - 1], self.id)) {
-            std.log.debug("Final, writing {s}", .{self.name});
+        if (overloaded and std.mem.eql(u8, fns.getLast(), self.id)) {
             try writer.print(
                 \\}};
                 \\
             , .{});
         }
+    }
+
+    pub fn hasLabel(self: Function) bool {
+        return self.name.len > 0 and !self.@"inline" and !self.@"extern";
     }
 };
 
@@ -1513,13 +1583,21 @@ pub const ElaboratedType = struct {
         @"enum",
         typename,
     };
+
+    pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
+        _ = .{ gpa, data };
+        try writer.print(
+            \\const {s} = {s};
+            \\
+        , .{ self.id, self.type });
+    }
 };
 
 pub const Union = struct {
     id: []u8,
     context: []u8,
-    name: []u8,
     members: []u8 = "",
+    name: []u8 = "",
     size: u64,
     @"align": u64,
 
@@ -1552,6 +1630,44 @@ pub const AtomicType = struct {
     @"align": u64,
 };
 
+pub const FunctionType = struct {
+    id: []u8,
+    returns: []u8,
+    arguments: []Argument = &.{},
+
+    pub fn writeMangledTypeSig(
+        self: FunctionType,
+        gpa: std.mem.Allocator,
+        data: TokenContainer,
+    ) (DataSearch || std.mem.Allocator.Error || std.Io.Writer.Error)![]u8 {
+        var writer = std.Io.Writer.Allocating.init(gpa);
+        errdefer writer.deinit();
+
+        const args = try writeMangledArguments(self.arguments, gpa, data);
+        defer gpa.free(args);
+        try writer.writer.print(
+            \\F{s}E
+        , .{args});
+        return writer.toOwnedSlice();
+    }
+
+    pub fn write(self: FunctionType, gpa: std.mem.Allocator, data: TokenContainer, out: *std.Io.Writer) !void {
+        _ = .{ gpa, data };
+        try out.print(
+            \\const {s} = fn (
+        , .{self.id});
+        for (self.arguments) |arg| {
+            try out.print(
+                \\{s}, 
+            , .{arg.type});
+        }
+        try out.print(
+            \\) {s};
+            \\
+        , .{self.returns});
+    }
+};
+
 pub const Argument = struct {
     // name: []u8,
     type: []u8,
@@ -1561,17 +1677,29 @@ pub const Argument = struct {
         const fundType = try getUnderlyingType(self, data) orelse return PrintError.InvalidArgumentType;
         switch (fundType) {
             inline else => |val| {
-                if (!@hasField(@TypeOf(val), "name")) std.debug.panic("Error: {} does not have member `type`", .{@TypeOf(val)});
-                const found = typeMap.get(val.name);
-                if (found) |str| {
-                    const retStr = try gpa.alloc(u8, str.@"0".len);
-                    @memcpy(retStr, str.@"0");
-                    return retStr;
-                } else {
-                    const retStr = try gpa.alloc(u8, val.name.len);
-                    @memcpy(retStr, val.name);
-                    return retStr;
-                }
+                if (@hasField(@TypeOf(val), "name")) {
+                    const found = typeMap.get(val.name);
+                    if (found) |str| {
+                        const retStr = try gpa.alloc(u8, str.@"0".len);
+                        @memcpy(retStr, str.@"0");
+                        return retStr;
+                    } else {
+                        const retStr = try gpa.alloc(u8, val.name.len);
+                        @memcpy(retStr, val.name);
+                        return retStr;
+                    }
+                } else if (@hasField(@TypeOf(val), "type")) {
+                    const found = typeMap.get(val.type);
+                    if (found) |str| {
+                        const retStr = try gpa.alloc(u8, str.@"0".len);
+                        @memcpy(retStr, str.@"0");
+                        return retStr;
+                    } else {
+                        const retStr = try gpa.alloc(u8, val.type.len);
+                        @memcpy(retStr, val.type);
+                        return retStr;
+                    }
+                } else std.debug.panic("Error type {} has no field names `type` or `name`", .{@TypeOf(val)});
             },
         }
     }
@@ -1779,7 +1907,9 @@ fn getUnderlyingType(token: anytype, data: TokenContainer) DataSearch!?TokenUnio
 
         else => {
             if (comptime @hasField(T, "type")) {
-                switch (data.find(token.type) orelse return DataSearch.MissingID) {
+                switch (data.find(token.type) orelse {
+                    return DataSearch.MissingID;
+                }) {
                     inline else => |value| return getUnderlyingType(value, data),
                 }
             } else {
@@ -1799,12 +1929,12 @@ fn getTypeSize(token: anytype, data: TokenContainer) DataSearch!?@Tuple(&.{ u64,
             };
             if (arr.max) |m| {
                 return .{
-                    underlyingInfo[0] * (m - arr.min + 1),
-                    underlyingInfo[1],
+                    underlyingInfo.@"0" * (m - arr.min + 1),
+                    underlyingInfo.@"1",
                 };
             } else return .{
                 0,
-                underlyingInfo[1],
+                underlyingInfo.@"1",
             };
         },
         else => void{},

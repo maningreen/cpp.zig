@@ -202,6 +202,7 @@ fn printFile(io: std.Io, gpa: std.mem.Allocator, out: *std.Io.Writer, file: []co
     std.log.info("Parsing tokens...", .{});
     var container = try parseTokens(gpa, ret);
     defer container.deinit(gpa);
+
     std.log.info("Done parsing tokens", .{});
     std.log.info("Printing to stdout", .{});
     var ctx = try token.Namespace.Context.init(gpa, container);
@@ -227,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
     if (init.minimal.args.vector.len == 1) return;
     const file = std.Io.File.stdout();
     defer file.close(init.io);
-    var writeBuf: [1028]u8 = undefined;
+    var writeBuf: [1]u8 = undefined;
     var writer = file.writer(init.io, &writeBuf);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const xmlArgs, const argsI = for (args[1..], 1..) |arg, i| {
