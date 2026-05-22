@@ -518,7 +518,7 @@ pub const Class = struct {
         var privateIterator: u64 = 0;
         const bases = try self.getBases(gpa, data);
         defer gpa.free(bases);
-        for (bases) |baseVal| {
+        for (bases[1..]) |baseVal| {
             const base = switch (data.find(baseVal.type) orelse return DataSearch.MissingID) {
                 .Class, .Struct => |v| v,
                 else => @panic("Error, reached undefined behavior!"),
@@ -1189,7 +1189,7 @@ pub const PointerType = struct {
     size: u64 = 8,
     @"align": u64 = 8,
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, _: void, writer: *std.Io.Writer) !void {
-        const namespaced = try namespacedType(self.id, data, gpa);
+        const namespaced = try namespacedType(self.type, data, gpa);
         defer gpa.free(namespaced);
         try writer.print("const {s} = ?*{s}; //ptr type\n", .{ self.id, namespaced });
     }
