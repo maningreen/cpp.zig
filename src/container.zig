@@ -85,3 +85,11 @@ pub fn find(self: @This(), id: []const u8) ?TokenUnion {
             return @unionInit(TokenUnion, @tagName(tokenType), val);
     return null;
 }
+
+pub fn findExplicit(self: @This(), id: []const u8, comptime types: []const token.type) token.CreateTokenUnion(types) {
+    const T = token.CreateTokenUnion(types);
+    return inline for (types) |t|
+        break @unionInit(T, @tagName(t), self.get(t).get(id) orelse continue)
+    else
+        null;
+}

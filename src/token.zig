@@ -76,6 +76,34 @@ fn writeMangledArguments(
     return writer.toOwnedSlice();
 }
 
+pub fn damagedType(t: anytype) bool {
+    const T = @TypeOf(t);
+
+    if (@typeInfo(T) == .@"union") {
+        switch (t) {
+            inline else => |v| return damagedType(v),
+        }
+    }
+
+    if (@hasField(T, "type"))
+        if (damagedType(t.type))
+            return true;
+
+    const checks = comptime [_][]const u8{
+        "incomplete",
+        "inline",
+        "artificial",
+    };
+
+    inline for (checks) |check| {
+        if (@hasField(T, check)) {
+            if (@field(t, check)) return true;
+        }
+    }
+
+    return false;
+}
+
 const typeMap = std.static_string_map.StaticStringMap(struct { []const u8, enum {
     custom,
     primitive,
@@ -249,7 +277,8 @@ pub const Class = struct {
         context: Context,
         writer: *std.Io.Writer,
     ) !void {
-        if (self.incomplete) return;
+        if (damagedType(self))
+            return;
 
         try writer.print(
             \\const @"{s}" = extern struct {{
@@ -296,7 +325,7 @@ pub const Class = struct {
                     .Constructor => |constructor| {
                         switch (constructor.access) {
                             .public => {
-                                if (!constructor.@"inline") {
+                                if (!damagedType(constructor)) {
                                     defer initIterator += 1;
 
                                     const mangled = try constructor.writeMangled(initIterator, gpa, data);
@@ -381,7 +410,7 @@ pub const Class = struct {
                 if (methodData.get(method.name)) |v|
                     if (v.items.len > 1) continue;
                 // inline methods have no labels, so we can't link
-                if (method.@"inline") continue;
+                if (damagedType(method)) continue;
                 // we won't print it, it's internal only
                 if (method.access != .public) continue;
                 const prefix = if (method.@"const") "const " else "";
@@ -442,24 +471,27 @@ pub const Class = struct {
     /// prints out all of the fields of the class,
     /// and the inherited members
     /// does *not* print _vtable
-    pub fn writeFields(self: Class, data: TokenContainer, gpa: std.mem.Allocator, writer: *std.Io.Writer) (DataSearch || std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+    pub fn writeFields(self: Class, data: TokenContainer, gpa: std.mem.Allocator, writer: *std.Io.Writer) (DataSearch || std.Io.Writer.Error || std.mem.Allocator.Error || BrokenType)!void {
         var it = self.memberIterator();
         var privateIterator: u64 = 0;
-        for (self.bases) |baseID| {
-            const base = data.find(baseID.type) orelse continue;
-            switch (base) {
-                .Class, .Struct => |baseClass| {
-                    switch (baseID.access) {
-                        .private, .protected => {
-                            try writer.print("_{d}: [{d}]u8 align({d}),\n", .{ privateIterator, baseClass.size, baseClass.@"align" / 8 });
-                            privateIterator += 1;
-                        },
-                        .public => {
-                            try baseClass.writeFields(data, gpa, writer);
-                        },
-                    }
+        const bases = try self.getBases(gpa, data);
+        defer gpa.free(bases);
+        for (bases) |baseVal| {
+            const base = switch (data.find(baseVal.type) orelse return DataSearch.MissingID) {
+                .Class, .Struct => |v| v,
+                else => @panic("Error, reached undefined behavior!"),
+            };
+            switch (baseVal.access) {
+                .private, .protected => {
+                    try writer.print("_{d}: [{d}]u8 align({d}),\n", .{ privateIterator, base.size / 8, base.@"align" });
+                    privateIterator += 1;
                 },
-                else => unreachable,
+                .public => {
+                    try writer.print(
+                        \\@"{s}": {s},
+                        \\
+                    , .{ base.name, base.id });
+                },
             }
         }
 
@@ -704,9 +736,7 @@ pub const Class = struct {
                 //          return _ZN7MyClass6myFuncEi(parent, arg_0);
                 //     }
                 try out.print(
-                    \\pub inline fn @"
-                ++ overloadTableFmt ++
-                    \\{s}"(self: *{s}
+                    \\pub inline fn @"{s}{s}"(self: *{s}
                 ++ overloadTableFmt ++
                     \\, 
                 , .{ method.name, sig, prefix, method.name });
@@ -911,6 +941,29 @@ pub const Class = struct {
             }
         }
         return construction.toOwnedSlice(gpa);
+    }
+
+    pub fn isBroken(self: Class, gpa: std.mem.Allocator, data: TokenContainer) !bool {
+        const bases = try self.getBases(gpa, data);
+        defer gpa.free(bases);
+
+        for (self.bases) |base| {
+            const baseVal = switch (data.find(base.type) orelse return true) {
+                .Class, .Struct => |v| v,
+                else => return true,
+            };
+            if (baseVal.isBroken(gpa, data)) return true;
+        }
+
+        var it = self.memberIterator();
+        while (it.next()) |memberId| {
+            switch (data.find(memberId) orelse return true) {
+                .Method => |method| {
+                    return method.isBroken(data);
+                },
+                inline else => |v| if (damagedType(v)) return true,
+            }
+        }
     }
 };
 
@@ -1385,6 +1438,7 @@ pub const Typedef = struct {
     name: []u8 = "",
     type: []u8,
     context: []u8,
+    line: u64,
 
     /// This Context is specifically for the following case
     /// ```cpp
@@ -1393,35 +1447,76 @@ pub const Typedef = struct {
     /// } MyStruct;
     /// ```
     pub const Context = struct {
+        const structureMembers = [_]@"type"{ .Struct, .Class, .Enumeration };
+
         structures: std.hash_map.StringHashMapUnmanaged(void),
+        defs: std.hash_map.HashMapUnmanaged(TypedefInfo, []const u8, TypedefInfo.HashContext, std.hash_map.default_max_load_percentage),
+
+        const TypedefInfo = struct {
+            name: []const u8,
+            // context: []const u8,
+
+            pub inline fn fromTypedef(t: Typedef) TypedefInfo {
+                return .{
+                    .name = t.name,
+                    // .context = t.context,
+                };
+            }
+
+            const HashContext = struct {
+                pub fn hash(_: HashContext, t: TypedefInfo) u64 {
+                    return 
+                        // std.hash_map.hashString(t.context) +% 
+                        std.hash_map.hashString(t.name);
+                }
+                pub fn eql(_: HashContext, a: TypedefInfo, b: TypedefInfo) bool {
+                    return std.mem.eql(u8, a.name, b.name);
+                    // return std.mem.eql(u8, a.context, b.context) and std.mem.eql(u8, a.name, b.name);
+                }
+            };
+        };
 
         pub fn init(gpa: std.mem.Allocator, data: TokenContainer) !Context {
-            var set = std.hash_map.StringHashMapUnmanaged(void).empty;
-            const members = [_]@"type"{ .Struct, .Class };
-            inline for (members) |member|
+            var self: Context = .{
+                .structures = .empty,
+                .defs = .empty,
+            };
+            inline for (structureMembers) |member|
                 for (data.get(member).values()) |v|
-                    try set.put(gpa, v.name, void{});
-            return .{ .structures = set };
+                    try self.structures.put(gpa, v.name, void{});
+
+            for (data.get(.Typedef).values()) |typedef| {
+                try self.defs.put(gpa, .fromTypedef(typedef), typedef.id);
+            }
+            return self;
         }
 
         pub fn deinit(self: *Context, gpa: std.mem.Allocator) void {
             self.structures.deinit(gpa);
+            self.defs.deinit(gpa);
         }
     };
 
     pub fn write(self: @This(), gpa: std.mem.Allocator, data: TokenContainer, ctx: Context, writer: *std.Io.Writer) !void {
         _ = .{ data, gpa };
+        if (damagedType(self.type))
+            return;
+
+        if (!std.mem.eql(u8, ctx.defs.get(.fromTypedef(self)).?, self.id)) return;
+
         if (ctx.structures.get(self.name)) |_| {
+            std.log.debug("prexisitng type {s}", .{self.name});
             try writer.print(
                 \\const {s} = {s};
                 \\
-            , .{ self.id, self.name });
+            , .{ self.id, self.type });
         } else {
+            std.log.debug("not prexisitng type {s}", .{self.name});
             try writer.print(
                 \\pub const {s} = {s};
                 \\const {s} = {s};
                 \\
-            , .{ self.name, self.type, self.id, self.name });
+            , .{ self.name, self.type, self.id, self.type });
         }
     }
 };
@@ -1704,7 +1799,7 @@ pub const Argument = struct {
         }
     }
 
-    pub const PrintError = error{InvalidArgumentType} || DataSearch || std.mem.Allocator.Error;
+    pub const PrintError = error{InvalidArgumentType} || DataSearch || std.mem.Allocator.Error || BrokenType;
 };
 
 pub fn setValue(
@@ -1756,7 +1851,7 @@ pub fn setValue(
     }
 }
 
-pub fn StructType(comptime t: @"type") type {
+pub inline fn StructType(comptime t: @"type") type {
     return @field(@This(), @tagName(t));
 }
 
@@ -1870,8 +1965,9 @@ pub fn deinitToken(comptime T: type) fn (*T, std.mem.Allocator) void {
     return fun;
 }
 
-pub const TokenUnion: type = blk: {
-    const types = std.enums.values(@"type");
+pub const TokenUnion: type = CreateTokenUnion(std.enums.values(@"type"));
+
+pub fn CreateTokenUnion(comptime types: []const @"type") type {
     var typeNames: [types.len][]const u8 = undefined;
     var fieldTypes: [types.len]type = undefined;
     var fieldAttrs = [1]std.builtin.Type.UnionField.Attributes{.{ .@"align" = null }} ** types.len;
@@ -1879,8 +1975,8 @@ pub const TokenUnion: type = blk: {
         typeNames[i] = @tagName(t);
         fieldTypes[i] = StructType(t);
     }
-    break :blk @Union(.auto, @"type", &typeNames, &fieldTypes, &fieldAttrs);
-};
+    return @Union(.auto, @"type", &typeNames, &fieldTypes, &fieldAttrs);
+}
 
 /// Will only return union members
 ///     - `.Class`,
@@ -1892,7 +1988,7 @@ pub const TokenUnion: type = blk: {
 ///     - `.ReferenceType`,
 /// Only returns `null` if `@TypeOf(token) == token.ElaboratedType`
 /// and lacks a valid type.
-fn getUnderlyingType(token: anytype, data: TokenContainer) DataSearch!?TokenUnion {
+fn getUnderlyingType(token: anytype, data: TokenContainer) (DataSearch || BrokenType)!?TokenUnion {
     const T = @TypeOf(token);
     const basename = comptime util.getBaseName(T);
 
@@ -1920,8 +2016,9 @@ fn getUnderlyingType(token: anytype, data: TokenContainer) DataSearch!?TokenUnio
 }
 
 /// returns size in bytes, and alignment in bytes
-fn getTypeSize(token: anytype, data: TokenContainer) DataSearch!?@Tuple(&.{ u64, u64 }) {
+fn getTypeSize(token: anytype, data: TokenContainer) (DataSearch || BrokenType)!?@Tuple(&.{ u64, u64 }) {
     const underlying = try getUnderlyingType(token, data) orelse return null;
+    if (damagedType(underlying)) return BrokenType.BrokenType;
     switch (underlying) {
         .ArrayType => |arr| {
             const underlyingInfo = switch (data.find(arr.type) orelse return DataSearch.MissingID) {
@@ -1964,3 +2061,4 @@ fn getTypeSize(token: anytype, data: TokenContainer) DataSearch!?@Tuple(&.{ u64,
 }
 
 pub const DataSearch = error{MissingID};
+pub const BrokenType = error{BrokenType};

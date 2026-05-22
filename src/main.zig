@@ -8,9 +8,7 @@ comptime {
     std.testing.refAllDecls(@This());
 }
 
-/// Caller owns memory
-/// returns the output, and stderr of the program
-fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: []const []const u8) ![]u8 {
+pub fn getCommand(gpa: std.mem.Allocator, path: []const u8, flags: []const []const u8) ![][]const u8 {
     const argv =
         try std.mem.concat(
             gpa,
@@ -22,6 +20,13 @@ fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: []const [
                 &.{")"},
             },
         );
+    return argv;
+}
+
+/// Caller owns memory
+/// returns the output, and stderr of the program
+fn getAST(io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: []const []const u8) ![]u8 {
+    const argv = try getCommand(gpa, path, flags);
     defer gpa.free(argv);
     std.log.info("Started castxml", .{});
     var child = try std.process.spawn(io, .{
@@ -232,7 +237,8 @@ pub fn main(init: std.process.Init) !void {
     var writer = file.writer(init.io, &writeBuf);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const xmlArgs, const argsI = for (args[1..], 1..) |arg, i| {
-        if (std.mem.eql(u8, arg, "--")) break .{ args[i + 1 ..], i };
+        if (std.mem.eql(u8, arg, "--")) break 
+            .{ args[i + 1 ..], i };
     } else .{ &.{}, args.len };
 
     for (args[1..argsI]) |arg|
