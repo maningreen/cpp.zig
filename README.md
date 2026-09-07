@@ -1,5 +1,5 @@
 # C++ Translator
-> [WARNING!]
+> [!WARNING]
 > This project works for the test case; however, It's yet to work on the c++stdlib, and I'm currently not working on it.
 ## Basis
 
